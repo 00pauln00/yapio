@@ -23,7 +23,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:"
+#define YAPIO_OPTS "b:n:hd:p:k"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -39,6 +39,7 @@ enum yapio_log_levels
     YAPIO_LL_ERROR = 1,
     YAPIO_LL_WARN  = 2,
     YAPIO_LL_DEBUG = 3,
+    YAPIO_LL_TRACE = 4,
     YAPIO_LL_MAX
 };
 
@@ -50,6 +51,7 @@ static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
 static char       *yapioFilePrefix     = YAPIO_DEFAULT_FILE_PREFIX;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
+static bool        yapioKeepFile       = false;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
 static char        yapioTestFileName[PATH_MAX + 1];
@@ -92,6 +94,8 @@ yapio_ll_to_string(enum yapio_log_levels yapio_ll)
         return "error";
     case YAPIO_LL_WARN:
         return "warn";
+    case YAPIO_LL_TRACE:
+        return "trace";
     default:
         break;
     }
@@ -132,6 +136,7 @@ yapio_print_help(int exit_val)
             "\t-b    block size\n"
             "\t-d    debugging level\n"
             "\t-h    print help message\n"
+            "\t-k    keep file after test completion\n"
             "\t-n    number of blocks per task\n"
             "\t-p    filename prefix\n",
             yapioExecName);
@@ -174,6 +179,9 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'h':
             yapio_print_help(YAPIO_EXIT_OK);
+            break;
+        case 'k':
+            yapioKeepFile = true;
             break;
         case 'n':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
@@ -347,7 +355,7 @@ yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
     {
         buffer_of_longs[i] = yapio_get_content_word(md, i);
 
-        log_msg(YAPIO_LL_DEBUG, "%zu:%llx", i, buffer_of_longs[i]);
+        log_msg(YAPIO_LL_TRACE, "%zu:%llx", i, buffer_of_longs[i]);
     }
 }
 
@@ -370,7 +378,7 @@ yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
             return -1;
         }
 
-        log_msg(YAPIO_LL_DEBUG, "OK %zu:%llx", i, buffer_of_longs[i]);
+        log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
     }
 
     return 0;
@@ -473,6 +481,23 @@ yapio_setup_buffers(void)
     yapio_initialize_source_md_buffer();
 }
 
+static void
+yapio_unlink_test_file(void)
+{
+    if (!yapioKeepFile && yapio_leader_rank())
+    {
+        int rc = unlink(yapioTestFileName);
+        if (rc)
+        {
+            log_msg(YAPIO_LL_ERROR, "unlink %s: %s", yapioTestFileName,
+                    strerror(errno));
+
+            yapio_exit(YAPIO_EXIT_ERR);
+        }
+        log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
+    }
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -489,6 +514,8 @@ main(int argc, char *argv[])
     yapio_close_test_file();
 
     yapio_destroy_buffers();
+
+    yapio_unlink_test_file();
 
     yapio_exit(YAPIO_EXIT_OK);
 
