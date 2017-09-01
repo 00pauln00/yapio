@@ -58,6 +58,7 @@ static int         yapioMyRank;
 static int         yapioNumRanks;
 static int         yapioFileDesc;
 //static int         yapioTestIteration;
+static char       *yapioIOBuf;
 
 /* Set of magic numbers which will be used for block tagging.
  */
@@ -67,8 +68,9 @@ static const unsigned long long yapioBlkMagics[YAPIO_NUM_BLK_MAGICS] =
 
 typedef struct yapio_blk_metadata
 {
-    int ybm_writer_rank;     //rank who has last written this block
-    int ybm_write_iteration; //iteration number of last write
+    int    ybm_writer_rank;     //rank who has last written this block
+    int    ybm_write_iteration; //iteration number of last write
+    size_t ybm_blk_number;      //number of the block
 } yapio_blk_md_t;
 
 yapio_blk_md_t *yapioSourceBlkMd; //metadata which this rank maintains
@@ -275,6 +277,8 @@ yapio_destroy_buffers(void)
         free(yapioSourceBlkMd);
     if (yapioSinkBlkMd)
         free(yapioSinkBlkMd);
+    if (yapioIOBuf)
+        free(yapioIOBuf);
 }
 
 static void
@@ -294,6 +298,31 @@ yapio_alloc_buffers(void)
     yapioSinkBlkMd = calloc(yapioNumBlks, sizeof(yapio_blk_md_t));
     if (yapioSinkBlkMd == NULL)
         yapio_destroy_buffers_and_abort();
+
+    yapioIOBuf = calloc(1, yapioBlkSz);
+    if (yapioIOBuf == NULL)
+        yapio_destroy_buffers_and_abort();
+}
+
+static void
+yapio_initialize_source_md_buffer(void)
+{
+    int i;
+    for (i = 0; i < yapioNumBlks; i++)
+    {
+        yapioSourceBlkMd[i].ybm_writer_rank = yapioMyRank;
+        yapioSourceBlkMd[i].ybm_blk_number = (yapioMyRank * yapioNumBlks) + i;
+
+        yapioSinkBlkMd[i].ybm_writer_rank = yapioMyRank;
+        yapioSinkBlkMd[i].ybm_blk_number = (yapioMyRank * yapioNumBlks) + i;
+    }
+}
+
+static void
+yapio_setup_buffers(void)
+{
+    yapio_alloc_buffers();
+    yapio_initialize_source_md_buffer();
 }
 
 int
@@ -302,7 +331,7 @@ main(int argc, char *argv[])
     yapio_mpi_setup(argc, argv);
     yapio_getopts(argc, argv);
 
-    yapio_alloc_buffers();
+    yapio_setup_buffers();
 
     yapio_setup_test_file();
     yapio_close_test_file();
