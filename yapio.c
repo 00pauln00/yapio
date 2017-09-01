@@ -57,6 +57,18 @@ static char        yapioTestFileName[PATH_MAX + 1];
 static int         yapioMyRank;
 static int         yapioNumRanks;
 static int         yapioFileDesc;
+//static int         yapioTestIteration;
+
+#define YAPIO_BLK_MAGIC 0xa3cfad825d //just a big prime number
+
+typedef struct yapio_blk_metadata
+{
+    int ybm_writer_rank;     //rank who has last written this block
+    int ybm_write_iteration; //iteration number of last write
+} yapio_blk_md_t;
+
+yapio_blk_md_t *yapioSourceBlkMd; //metadata which this rank maintains
+yapio_blk_md_t *yapioSinkBlkMd;   //metadata pushed from others to this rank
 
 static const char *
 yapio_ll_to_string(enum yapio_log_levels yapio_ll)
@@ -252,13 +264,47 @@ yapio_close_test_file(void)
         log_msg(YAPIO_LL_FATAL, "close: %s", strerror(errno));
 }
 
+static void
+yapio_destroy_buffers(void)
+{
+    if (yapioSourceBlkMd)
+        free(yapioSourceBlkMd);
+    if (yapioSinkBlkMd)
+        free(yapioSinkBlkMd);
+}
+
+static void
+yapio_destroy_buffers_and_abort(void)
+{
+    yapio_destroy_buffers();
+    log_msg(YAPIO_LL_FATAL, "yapio_setup_buffers() %s", strerror(ENOMEM));
+}
+
+static void
+yapio_alloc_buffers(void)
+{
+    yapioSourceBlkMd = calloc(yapioNumBlks, sizeof(yapio_blk_md_t));
+    if (yapioSourceBlkMd == NULL)
+        yapio_destroy_buffers_and_abort();
+
+    yapioSinkBlkMd = calloc(yapioNumBlks, sizeof(yapio_blk_md_t));
+    if (yapioSinkBlkMd == NULL)
+        yapio_destroy_buffers_and_abort();
+}
+
 int
 main(int argc, char *argv[])
 {
     yapio_mpi_setup(argc, argv);
     yapio_getopts(argc, argv);
+
+    yapio_alloc_buffers();
+
     yapio_setup_test_file();
     yapio_close_test_file();
+
+    yapio_destroy_buffers();
+
     yapio_exit(YAPIO_EXIT_OK);
 
     return 0;
