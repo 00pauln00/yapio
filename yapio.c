@@ -59,7 +59,11 @@ static int         yapioNumRanks;
 static int         yapioFileDesc;
 //static int         yapioTestIteration;
 
-#define YAPIO_BLK_MAGIC 0xa3cfad825d //just a big prime number
+/* Set of magic numbers which will be used for block tagging.
+ */
+#define YAPIO_NUM_BLK_MAGICS 4
+static const unsigned long long yapioBlkMagics[YAPIO_NUM_BLK_MAGICS] =
+{0xa3cfad825d, 0xf0f0f0f0f0f0f0f0, 0x181ce41215, 0x01030507090a0c0e};
 
 typedef struct yapio_blk_metadata
 {
