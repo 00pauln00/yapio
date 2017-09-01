@@ -377,12 +377,9 @@ yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
 }
 
 static off_t
-yapio_get_rw_offset(size_t op_num)
+yapio_get_rw_offset(const yapio_blk_md_t *md, size_t blk_sz)
 {
-    if (op_num >= yapioNumBlksPerRank)
-        return -1;
-
-    off_t rw_offset = yapioSinkBlkMd[op_num].ybm_blk_number * yapioBlkSz;
+    off_t rw_offset = md->ybm_blk_number * blk_sz;
 
     return rw_offset;
 }
@@ -407,7 +404,7 @@ yapio_rw(bool write)
 
         /* Obtain this IO's offset from the
          */
-        off_t off = yapio_get_rw_offset(i);
+        off_t off = yapio_get_rw_offset(md, yapioBlkSz);
         if (off < 0)
         {
             log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed");
