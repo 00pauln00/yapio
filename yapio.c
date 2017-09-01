@@ -14,7 +14,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <getopt.h>
-//#include <assert.h>
 #include <mpi.h>
 #include <errno.h>
 #include <string.h>
@@ -46,18 +45,18 @@ enum yapio_log_levels
 #define YAPIO_EXIT_OK  0
 #define YAPIO_EXIT_ERR 1
 
-static size_t      yapioNumBlks    = YAPIO_DEF_NBLKS_PER_PE;
-static size_t      yapioBlkSz      = YAPIO_DEF_BLK_SIZE;
-static char       *yapioFilePrefix = YAPIO_DEFAULT_FILE_PREFIX;
-static int         yapioDbgLevel   = YAPIO_LL_WARN;
-static bool        yapioMpiInit    = false;
+static size_t      yapioNumBlksPerRank = YAPIO_DEF_NBLKS_PER_PE;
+static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
+static char       *yapioFilePrefix     = YAPIO_DEFAULT_FILE_PREFIX;
+static int         yapioDbgLevel       = YAPIO_LL_WARN;
+static bool        yapioMpiInit        = false;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
 static char        yapioTestFileName[PATH_MAX + 1];
 static int         yapioMyRank;
 static int         yapioNumRanks;
 static int         yapioFileDesc;
-//static int         yapioTestIteration;
+static int         yapioTestIteration;
 static char       *yapioIOBuf;
 
 /* Set of magic numbers which will be used for block tagging.
@@ -65,6 +64,12 @@ static char       *yapioIOBuf;
 #define YAPIO_NUM_BLK_MAGICS 4
 static const unsigned long long yapioBlkMagics[YAPIO_NUM_BLK_MAGICS] =
 {0xa3cfad825d, 0xf0f0f0f0f0f0f0f0, 0x181ce41215, 0x01030507090a0c0e};
+
+static unsigned long long
+yapio_get_blk_magic(size_t blk_num)
+{
+    return yapioBlkMagics[blk_num % YAPIO_NUM_BLK_MAGICS];
+}
 
 typedef struct yapio_blk_metadata
 {
@@ -171,7 +176,7 @@ yapio_getopts(int argc, char **argv)
             yapio_print_help(YAPIO_EXIT_OK);
             break;
         case 'n':
-            yapioNumBlks = strtoull(optarg, NULL, 10);
+            yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
             break;
         case 'p':
             yapioFilePrefix = optarg;
@@ -189,15 +194,15 @@ yapio_getopts(int argc, char **argv)
     if (!yapioTestRootDir || argc > (optind + 1))
         yapio_print_help(YAPIO_EXIT_ERR);
 
-    if ((yapioNumBlks * yapioBlkSz) > YAPIO_MAX_SIZE_PER_PE)
+    if ((yapioNumBlksPerRank * yapioBlkSz) > YAPIO_MAX_SIZE_PER_PE)
         log_msg(YAPIO_LL_FATAL,
                 "Per rank data size (%zu) exceeds max (%llu)",
-                (yapioNumBlks * yapioBlkSz), YAPIO_MAX_SIZE_PER_PE);
+                (yapioNumBlksPerRank * yapioBlkSz), YAPIO_MAX_SIZE_PER_PE);
 
     if (yapio_leader_rank())
     {
         log_msg(YAPIO_LL_DEBUG, "nblks=%zu blksz=%zu",
-                yapioNumBlks, yapioBlkSz);
+                yapioNumBlksPerRank, yapioBlkSz);
         log_msg(YAPIO_LL_DEBUG, "prefix=%s dirname=%s",
                 yapioFilePrefix, yapioTestRootDir);
         log_msg(YAPIO_LL_DEBUG, "rank=%d num_ranks=%d",
@@ -291,11 +296,11 @@ yapio_destroy_buffers_and_abort(void)
 static void
 yapio_alloc_buffers(void)
 {
-    yapioSourceBlkMd = calloc(yapioNumBlks, sizeof(yapio_blk_md_t));
+    yapioSourceBlkMd = calloc(yapioNumBlksPerRank, sizeof(yapio_blk_md_t));
     if (yapioSourceBlkMd == NULL)
         yapio_destroy_buffers_and_abort();
 
-    yapioSinkBlkMd = calloc(yapioNumBlks, sizeof(yapio_blk_md_t));
+    yapioSinkBlkMd = calloc(yapioNumBlksPerRank, sizeof(yapio_blk_md_t));
     if (yapioSinkBlkMd == NULL)
         yapio_destroy_buffers_and_abort();
 
@@ -308,14 +313,160 @@ static void
 yapio_initialize_source_md_buffer(void)
 {
     int i;
-    for (i = 0; i < yapioNumBlks; i++)
+    for (i = 0; i < yapioNumBlksPerRank; i++)
     {
         yapioSourceBlkMd[i].ybm_writer_rank = yapioMyRank;
-        yapioSourceBlkMd[i].ybm_blk_number = (yapioMyRank * yapioNumBlks) + i;
+        yapioSourceBlkMd[i].ybm_blk_number =
+            (yapioMyRank * yapioNumBlksPerRank) + i;
 
         yapioSinkBlkMd[i].ybm_writer_rank = yapioMyRank;
-        yapioSinkBlkMd[i].ybm_blk_number = (yapioMyRank * yapioNumBlks) + i;
+        yapioSinkBlkMd[i].ybm_blk_number =
+            (yapioMyRank * yapioNumBlksPerRank) + i;
     }
+}
+
+static unsigned long long
+yapio_get_content_word(const yapio_blk_md_t *md, size_t word_num)
+{
+    unsigned long long content_word =
+        (yapio_get_blk_magic(md->ybm_blk_number) + md->ybm_writer_rank +
+         md->ybm_blk_number + word_num);
+
+    return content_word;
+}
+
+static void
+yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
+                                  const yapio_blk_md_t *md)
+{
+    unsigned long long *buffer_of_longs = (unsigned long long *)buf;
+    size_t num_words = buf_len / sizeof(unsigned long long);
+
+    size_t i;
+    for (i = 0; i < num_words; i++)
+    {
+        buffer_of_longs[i] = yapio_get_content_word(md, i);
+
+        log_msg(YAPIO_LL_DEBUG, "%zu:%llx", i, buffer_of_longs[i]);
+    }
+}
+
+static int
+yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
+                                   const yapio_blk_md_t *md)
+{
+    const unsigned long long *buffer_of_longs = (unsigned long long *)buf;
+    size_t num_words = buf_len / sizeof(unsigned long long);
+
+    size_t i;
+    for (i = 0; i < num_words; i++)
+    {
+        if (buffer_of_longs[i] != yapio_get_content_word(md, i))
+        {
+            log_msg(YAPIO_LL_ERROR, "blk=%zu word=%zu got=%llx expected=%llx",
+                    md->ybm_blk_number, i, buffer_of_longs[i],
+                    yapio_get_content_word(md, i));
+
+            return -1;
+        }
+
+        log_msg(YAPIO_LL_DEBUG, "OK %zu:%llx", i, buffer_of_longs[i]);
+    }
+
+    return 0;
+}
+
+static off_t
+yapio_get_rw_offset(size_t op_num)
+{
+    if (op_num >= yapioNumBlksPerRank)
+        return -1;
+
+    off_t rw_offset = yapioSinkBlkMd[op_num].ybm_blk_number * yapioBlkSz;
+
+    return rw_offset;
+}
+
+/**
+ * yapio_initialize_test_file_contents - each rank in the job writes its
+ *    implicitly assigned set of contiguous blocks.
+ */
+static int
+yapio_rw(bool write)
+{
+    int rc = 0;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    size_t i;
+    for (i = 0; i < yapioNumBlksPerRank; i++)
+    {
+        const yapio_blk_md_t *md = &yapioSinkBlkMd[i];
+
+        if (write)
+            yapio_apply_contents_to_io_buffer(yapioIOBuf, yapioBlkSz, md);
+
+        /* Obtain this IO's offset from the
+         */
+        off_t off = yapio_get_rw_offset(i);
+        if (off < 0)
+        {
+            log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed");
+            rc = -ERANGE;
+            break;
+        }
+
+        ssize_t io_rc, io_bytes = 0;
+        do
+        {
+            char *adjusted_buf = yapioIOBuf + io_bytes;
+            size_t adjusted_io_len = yapioBlkSz - io_bytes;
+            off_t adjusted_off = off + io_bytes;
+
+            io_rc = write ?
+                pwrite(yapioFileDesc, adjusted_buf, adjusted_io_len,
+                       adjusted_off) :
+                pread(yapioFileDesc, adjusted_buf, adjusted_io_len,
+                      adjusted_off);
+
+            if (io_rc > 0)
+                io_bytes += io_rc;
+
+        } while (io_rc > 0 && io_bytes < yapioBlkSz);
+
+        if (io_rc < 0)
+        {
+            log_msg(YAPIO_LL_ERROR, "io failed at offset %lu: %s",
+                    off, strerror(errno));
+            rc = -errno;
+            break;
+        }
+
+        if (!write)
+        {
+            rc =
+                yapio_verify_contents_of_io_buffer(yapioIOBuf, yapioBlkSz, md);
+            if (rc)
+                break;
+        }
+    }
+
+    if (!rc)
+    {
+        rc = fsync(yapioFileDesc);
+        if (rc)
+        {
+            rc = -errno;
+            log_msg(YAPIO_LL_ERROR, "fsync(): %s", strerror(errno));
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    /* Increment the test iteration
+     */
+    yapioTestIteration++;
+
+    return rc;
 }
 
 static void
@@ -334,6 +485,10 @@ main(int argc, char *argv[])
     yapio_setup_buffers();
 
     yapio_setup_test_file();
+
+    yapio_rw(true);
+    yapio_rw(false);
+
     yapio_close_test_file();
 
     yapio_destroy_buffers();
