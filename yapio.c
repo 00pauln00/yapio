@@ -572,6 +572,82 @@ yapio_read_from_dev_urandom(void *buffer, size_t size)
 }
 
 /**
+ * yapio_test_context_setup_skip_mpi_gather - setup driver for the 'local' I/O
+ *    mode where each rank determines its own work queue.
+ * Note: YAPIO_IOP_STRIDED mode is not supported in this mode.
+ */
+static int
+yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
+{
+    if (!ytc->ytc_skip_mpi_gather)
+        return -EINVAL;
+
+    if (ytc->ytc_io_pattern == YAPIO_IOP_STRIDED)
+        return -ENOTSUP;
+
+    /* In this mode all operation instructions are pulled from the local
+     * Source Blk Metadata - there is no exchange with other ranks.
+     */
+    ytc->ytc_num_ops_per_rank[yapioMyRank] = yapioNumBlksPerRank;
+    ytc->ytc_ops_md[yapioMyRank] = calloc(yapioNumBlksPerRank,
+                                          sizeof(yapio_blk_md_t));
+
+    yapio_blk_md_t *md = ytc->ytc_ops_md[yapioMyRank];
+    if (!md)
+        return -ENOMEM;
+
+    if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
+    {
+        int i;
+        for (i = 0; i < yapioNumBlksPerRank; i++)
+        {
+            int src_idx = i;
+
+            if (ytc->ytc_backwards)
+                src_idx = (yapioNumBlksPerRank - 1 - i);
+
+            md[i] = yapioSourceBlkMd[src_idx];
+            log_msg(YAPIO_LL_TRACE, "rank=%d md->ybm_blk_number=%zd",
+                    md[i].ybm_writer_rank, md[i].ybm_blk_number);
+        }
+    }
+    else if (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM)
+    {
+        size_t buf_sz = yapioNumBlksPerRank * sizeof(int);
+        int *array_of_randoms = malloc(buf_sz);
+        if (!array_of_randoms)
+            return -ENOMEM;
+
+        int rc = yapio_read_from_dev_urandom((void *)array_of_randoms, buf_sz);
+        if (rc)
+            return rc;
+
+        int i;
+        for (i = 0; i < yapioNumBlksPerRank; i++)
+            md[i] = yapioSourceBlkMd[i];
+
+        for (i = 0; i < yapioNumBlksPerRank; i++)
+        {
+            int swap_idx = array_of_randoms[i] % yapioNumBlksPerRank;
+            yapio_blk_md_t md_tmp = md[swap_idx];
+            md[swap_idx] = md[i];
+            md[i] = md_tmp;
+
+            log_msg(YAPIO_LL_TRACE, "swapped %d:%zu <-> %d:%zu",
+                    i, md[swap_idx].ybm_blk_number, swap_idx,
+                    md[i].ybm_blk_number);
+        }
+    }
+    else
+    {
+        log_msg(YAPIO_LL_WARN, "unknown io_pattern=%d", ytc->ytc_io_pattern);
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+/**
  * yapio_test_context_setup - Allocates memory buffers for the test according
  *   to the input data in the yapio_test_ctx_t.  After memory allocation, this
  *   function will arrange the yapio_blk_md_t either autonomously or in
@@ -595,75 +671,19 @@ yapio_test_context_setup(yapio_test_ctx_t *ytc)
 
     if (ytc->ytc_skip_mpi_gather)
     {
-        /* In this mode all operation instructions are pulled from the local
-         * Source Blk Metadata - there is no exchange with other ranks.
-         */
-        ytc->ytc_num_ops_per_rank[yapioMyRank] = yapioNumBlksPerRank;
-        ytc->ytc_ops_md[yapioMyRank] = calloc(yapioNumBlksPerRank,
-                                              sizeof(yapio_blk_md_t));
-
-        yapio_blk_md_t *md = ytc->ytc_ops_md[yapioMyRank];
-        if (!md)
+        int rc = yapio_test_context_setup_skip_mpi_gather(ytc);
+        if (rc)
         {
+            log_msg(YAPIO_LL_ERROR,
+                    "yapio_test_context_setup_skip_mpi_gather: %s",
+                    strerror(-rc));
+
             yapio_test_ctx_release(ytc);
-            return -ENOMEM;
-        }
 
-        if (ytc->ytc_io_pattern == YAPIO_IOP_STRIDED)
-        {
-            yapio_test_ctx_release(ytc);
-            return -EINVAL;
-        }
-        else if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
-        {
-            int i;
-            for (i = 0; i < yapioNumBlksPerRank; i++)
-            {
-                int src_idx = i;
-
-                if (ytc->ytc_backwards)
-                    src_idx = (yapioNumBlksPerRank - 1 - i);
-
-                md[i] = yapioSourceBlkMd[src_idx];
-                log_msg(YAPIO_LL_TRACE, "rank=%d md->ybm_blk_number=%zd",
-                        md[i].ybm_writer_rank, md[i].ybm_blk_number);
-            }
-        }
-        else if (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM)
-        {
-            size_t buf_sz = yapioNumBlksPerRank * sizeof(int);
-            int *array_of_randoms = malloc(buf_sz);
-            if (!array_of_randoms)
-            {
-                yapio_test_ctx_release(ytc);
-                return -ENOMEM;
-            }
-
-            int rc = yapio_read_from_dev_urandom((void *)array_of_randoms,
-                                                 buf_sz);
-            if (rc)
-            {
-                yapio_test_ctx_release(ytc);
-                return rc;
-            }
-
-            int i;
-            for (i = 0; i < yapioNumBlksPerRank; i++)
-                md[i] = yapioSourceBlkMd[i];
-
-            for (i = 0; i < yapioNumBlksPerRank; i++)
-            {
-                int swap_idx = array_of_randoms[i] % yapioNumBlksPerRank;
-                yapio_blk_md_t md_tmp = md[swap_idx];
-                md[swap_idx] = md[i];
-                md[i] = md_tmp;
-
-                log_msg(YAPIO_LL_TRACE, "swapped %d:%zu <-> %d:%zu",
-                        i, md[swap_idx].ybm_blk_number, swap_idx,
-                        md[i].ybm_blk_number)
-            }
+            return rc;
         }
     }
+
     return 0;
 }
 
