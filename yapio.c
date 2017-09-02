@@ -571,6 +571,37 @@ yapio_read_from_dev_urandom(void *buffer, size_t size)
     return error;
 }
 
+static yapio_blk_md_t *
+yapio_test_context_alloc_rank(yapio_test_ctx_t *ytc, int rank_idx,
+                              size_t nblks)
+{
+    ytc->ytc_num_ops_per_rank[rank_idx] = nblks;
+    ytc->ytc_ops_md[rank_idx] = calloc(nblks, sizeof(yapio_blk_md_t));
+
+    return ytc->ytc_ops_md[rank_idx];
+}
+
+static void
+yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
+                                             int rank_idx)
+{
+    yapio_blk_md_t *md = ytc->ytc_ops_md[rank_idx];
+    if (!md)
+        log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank_idx);
+
+    const size_t nblks = ytc->ytc_num_ops_per_rank[rank_idx];
+
+    unsigned i;
+    for (i = 0; i < nblks; i++)
+    {
+        unsigned src_idx = ytc->ytc_backwards ? nblks - i - 1 : i;
+
+        md[i] = yapioSourceBlkMd[src_idx];
+        log_msg(YAPIO_LL_TRACE, "rank=%d md->ybm_blk_number=%zd",
+                md[i].ybm_writer_rank, md[i].ybm_blk_number);
+    }
+}
+
 /**
  * yapio_test_context_setup_skip_mpi_gather - setup driver for the 'local' I/O
  *    mode where each rank determines its own work queue.
@@ -580,36 +611,33 @@ static int
 yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
 {
     if (!ytc->ytc_skip_mpi_gather)
+    {
         return -EINVAL;
-
-    if (ytc->ytc_io_pattern == YAPIO_IOP_STRIDED)
+    }
+    else if (ytc->ytc_io_pattern == YAPIO_IOP_STRIDED)
+    {
         return -ENOTSUP;
+    }
+    else if (ytc->ytc_io_pattern != YAPIO_IOP_SEQUENTIAL &&
+             ytc->ytc_io_pattern != YAPIO_IOP_RANDOM)
+    {
+
+        log_msg(YAPIO_LL_WARN, "unknown io_pattern=%d", ytc->ytc_io_pattern);
+        return -EBADRQC;
+    }
 
     /* In this mode all operation instructions are pulled from the local
      * Source Blk Metadata - there is no exchange with other ranks.
      */
-    ytc->ytc_num_ops_per_rank[yapioMyRank] = yapioNumBlksPerRank;
-    ytc->ytc_ops_md[yapioMyRank] = calloc(yapioNumBlksPerRank,
-                                          sizeof(yapio_blk_md_t));
+    yapio_blk_md_t *md =
+        yapio_test_context_alloc_rank(ytc, yapioMyRank, yapioNumBlksPerRank);
 
-    yapio_blk_md_t *md = ytc->ytc_ops_md[yapioMyRank];
     if (!md)
         return -ENOMEM;
 
     if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
     {
-        int i;
-        for (i = 0; i < yapioNumBlksPerRank; i++)
-        {
-            int src_idx = i;
-
-            if (ytc->ytc_backwards)
-                src_idx = (yapioNumBlksPerRank - 1 - i);
-
-            md[i] = yapioSourceBlkMd[src_idx];
-            log_msg(YAPIO_LL_TRACE, "rank=%d md->ybm_blk_number=%zd",
-                    md[i].ybm_writer_rank, md[i].ybm_blk_number);
-        }
+        yapio_test_context_sequential_setup_for_rank(ytc, yapioMyRank);
     }
     else if (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM)
     {
@@ -637,11 +665,6 @@ yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
                     i, md[swap_idx].ybm_blk_number, swap_idx,
                     md[i].ybm_blk_number);
         }
-    }
-    else
-    {
-        log_msg(YAPIO_LL_WARN, "unknown io_pattern=%d", ytc->ytc_io_pattern);
-        return -EINVAL;
     }
 
     return 0;
