@@ -508,7 +508,7 @@ yapio_alloc_buffers(void)
 static void
 yapio_initialize_source_md_buffer(void)
 {
-    int i;
+    size_t i;
     for (i = 0; i < yapioNumBlksPerRank; i++)
     {
         yapioSourceBlkMd[i].ybm_writer_rank = yapioMyRank;
@@ -656,7 +656,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
                 if (io_rc > 0)
                     io_bytes += io_rc;
 
-            } while (io_rc > 0 && io_bytes < yapioBlkSz);
+            } while (io_rc > 0 && (size_t)io_bytes < yapioBlkSz);
 
             if (io_rc < 0)
             {
@@ -874,18 +874,18 @@ yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
         if (rc)
             return rc;
 
-        int i;
+        size_t i;
         for (i = 0; i < yapioNumBlksPerRank; i++)
             md[i] = yapioSourceBlkMd[i];
 
         for (i = 0; i < yapioNumBlksPerRank; i++)
         {
-            int swap_idx = array_of_randoms[i] % yapioNumBlksPerRank;
+            size_t swap_idx = array_of_randoms[i] % yapioNumBlksPerRank;
             yapio_blk_md_t md_tmp = md[swap_idx];
             md[swap_idx] = md[i];
             md[i] = md_tmp;
 
-            log_msg(YAPIO_LL_TRACE, "swapped %d:%zu <-> %d:%zu",
+            log_msg(YAPIO_LL_TRACE, "swapped %zu:%zu <-> %zu:%zu",
                     i, md[swap_idx].ybm_blk_number, swap_idx,
                     md[i].ybm_blk_number);
         }
