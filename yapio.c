@@ -23,7 +23,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:k"
+#define YAPIO_OPTS "b:n:hd:p:kt:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -48,6 +48,7 @@ enum yapio_patterns
     YAPIO_IOP_SEQUENTIAL,
     YAPIO_IOP_RANDOM,
     YAPIO_IOP_STRIDED,
+    YAPIO_IOP_MAX
 };
 
 #define YAPIO_EXIT_OK  0
@@ -104,14 +105,19 @@ enum yapio_test_ctx_mdh_in_out
 
 typedef struct yapio_test_context
 {
-    bool                ytc_leave_holes;      //some writes are skipped
-    bool                ytc_backwards;        //IOs are done in reverse order
-    bool                ytc_skip_mpi_gather;  //tests local buffers only
-//    bool                ytc_no_fsync;
-    bool                ytc_write;
+    unsigned            ytc_leave_holes:1,
+                        ytc_backwards:1,
+                        ytc_remote_locality:1,
+                        ytc_read:1,
+                        ytc_no_fsync:1;
     enum yapio_patterns ytc_io_pattern;       //IO pattern to be employed
     yapio_test_ctx_md_t ytc_in_out_md_ops[YAPIO_TEST_CTX_MDH_MAX];
 } yapio_test_ctx_t;
+
+#define YAPIO_NUM_TEST_CTXS_MAX 32
+
+static yapio_test_ctx_t yapioTestCtxs[YAPIO_NUM_TEST_CTXS_MAX];
+static int              yapioNumTestCtxs;
 
 static const char *
 yapio_ll_to_string(enum yapio_log_levels yapio_ll)
@@ -145,6 +151,12 @@ yapio_exit(int exit_rc)
     exit(exit_rc);
 }
 
+static bool
+yapio_leader_rank(void)
+{
+    return yapioMyRank == 0 ? true : false;
+}
+
 #define log_msg(lvl, message, ...)                                  \
     {                                                               \
         if (lvl <= yapioDbgLevel)                                   \
@@ -157,19 +169,33 @@ yapio_exit(int exit_rc)
         }                                                           \
     }
 
+#define log_msg_r0(lvl, message, ...)       \
+    {                                           \
+        if (yapio_leader_rank())                \
+            log_msg(lvl, message, ##__VA_ARGS__);   \
+    }
+
 static void
 yapio_print_help(int exit_val)
 {
-    fprintf(exit_val ? stderr : stdout,
-            "%s [OPTION] DIRECTORY\n\n"
-            "Options:\n"
-            "\t-b    block size\n"
-            "\t-d    debugging level\n"
-            "\t-h    print help message\n"
-            "\t-k    keep file after test completion\n"
-            "\t-n    number of blocks per task\n"
-            "\t-p    filename prefix\n",
-            yapioExecName);
+    if (yapio_leader_rank())
+        fprintf(exit_val ? stderr : stdout,
+                "%s [OPTION] DIRECTORY\n\n"
+                "Options:\n"
+                "\t-b    Block size\n"
+                "\t-d    Debugging level\n"
+                "\t-h    Print help message\n"
+                "\t-k    Keep file after test completion\n"
+                "\t-n    Number of blocks per task\n"
+                "\t-p    File name prefix\n"
+                "\t-t    Test description\n"
+                "\t      - I/O Op:   read (r), write (w)\n"
+                "\t      - Pattern:  sequential (s), random (R), strided (S)\n"
+                "\t      - Locality: local (L), distributed (D)\n"
+                "\t      - Options:  backwards (b), holes (h), no-fsync (f)\n"
+                "\n\t      Example: -t wsL,rRD\n"
+                "\t        sequential write, distribute reads randomly\n",
+                yapioExecName);
 
     exit(exit_val);
 }
@@ -184,10 +210,143 @@ yapio_mpi_setup(int argc, char **argv)
     yapioMpiInit = true;
 }
 
-static bool
-yapio_leader_rank(void)
+#define YAPIO_RECIPE_STRLEN_MAX 1025
+static int
+yapio_parse_test_recipe(const char *recipe_str)
 {
-    return yapioMyRank == 0 ? true : false;
+    size_t recipe_str_len = strnlen(recipe_str, YAPIO_RECIPE_STRLEN_MAX);
+    if (recipe_str_len >= YAPIO_RECIPE_STRLEN_MAX)
+    {
+        log_msg(YAPIO_LL_ERROR, "recipe input string is too long");
+        return -E2BIG;
+    }
+
+    yapioNumTestCtxs = 1;
+
+    int rc = 0;
+    int rw, locality, io_pattern;
+    int test_ctx_idx;
+
+    rw = locality = io_pattern = -1;
+
+    unsigned i;
+    for (i = 0; i < recipe_str_len; i++)
+    {
+        test_ctx_idx = yapioNumTestCtxs - 1;
+
+        /* If mutually exclusive options have been violated then exit the loop.
+         */
+        if (rw > 0 || locality > 0 || io_pattern > 0)
+            break;
+
+        const char c = recipe_str[i];
+        switch (c)
+        {
+        case 'w': //'w' and 'r' are mutually exclusive
+            if (!++rw)
+                yapioTestCtxs[test_ctx_idx].ytc_read = 0;
+            break;
+
+        case 'r':
+            if (!++rw)
+                yapioTestCtxs[test_ctx_idx].ytc_read = 1;
+            break;
+
+        case 's': //'s', 'S', and 'r' are mutually exclusive:
+            if (!++io_pattern)
+                yapioTestCtxs[test_ctx_idx].ytc_io_pattern =
+                    YAPIO_IOP_SEQUENTIAL;
+            break;
+
+        case 'S':
+            if (!++io_pattern)
+                yapioTestCtxs[test_ctx_idx].ytc_io_pattern =
+                    YAPIO_IOP_STRIDED;
+            break;
+
+        case 'R':
+            if (!++io_pattern)
+                yapioTestCtxs[test_ctx_idx].ytc_io_pattern =
+                    YAPIO_IOP_RANDOM;
+            break;
+
+        case 'L':
+            if (++locality)
+                yapioTestCtxs[test_ctx_idx].ytc_remote_locality = 0;
+            break;
+        case 'D':
+            if (++locality)
+                yapioTestCtxs[test_ctx_idx].ytc_remote_locality = 1;
+            break;
+
+        case 'b':
+            yapioTestCtxs[test_ctx_idx].ytc_backwards = 1;
+            break;
+        case 'h':
+            yapioTestCtxs[test_ctx_idx].ytc_leave_holes = 1;
+            break;
+        case 'f':
+            yapioTestCtxs[test_ctx_idx].ytc_no_fsync = 1;
+            break;
+
+        case ',':
+            yapioNumTestCtxs++;
+            rw = locality = io_pattern = -1;
+            break;
+
+        default:
+            log_msg_r0(YAPIO_LL_ERROR,
+                       "invalid recipe character '%c': test %d, pos %u",
+                       c, test_ctx_idx, i);
+            return -EINVAL;
+        }
+    }
+
+    if (rw)
+    {
+        if (rw > 0)
+        {
+            log_msg_r0(YAPIO_LL_ERROR,
+                       "'r', 'w' are mutually exclusive: test %d, pos %u",
+                       test_ctx_idx, i);
+        }
+        else
+        {
+            log_msg_r0(YAPIO_LL_ERROR, "'r' or 'w' not specified: test %d",
+                       test_ctx_idx);
+        }
+
+        rc = -EINVAL;
+    }
+    else if (io_pattern)
+    {
+        if (io_pattern > 0)
+        {
+            log_msg_r0(YAPIO_LL_ERROR,
+                       "'s', 'S', 'R' are mutually exclusive: test %d, pos %u",
+                       test_ctx_idx, i);
+        }
+        else
+        {
+            log_msg_r0(YAPIO_LL_ERROR,
+                       "'s', 'S' or 'R' not specified: test %d",
+                       test_ctx_idx);
+        }
+
+        rc = -EINVAL;
+    }
+    else if (locality > 0)
+    {
+        if (locality > 0)
+        {
+            log_msg_r0(YAPIO_LL_ERROR,
+                       "L', 'D' are mutually exclusive: test %d, pos %u",
+                       test_ctx_idx, i);
+        }
+        rc = -EINVAL;
+    }
+
+    return rc;
 }
 
 static void
@@ -218,6 +377,10 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'p':
             yapioFilePrefix = optarg;
+            break;
+        case 't':
+            if (yapio_parse_test_recipe(optarg))
+                yapio_print_help(YAPIO_EXIT_ERR);
             break;
         default:
             yapio_print_help(YAPIO_EXIT_ERR);
@@ -460,7 +623,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         {
             const yapio_blk_md_t *md = &md_array[j];
 
-            if (ytc->ytc_write)
+            if (!ytc->ytc_read)
                 yapio_apply_contents_to_io_buffer(yapioIOBuf, yapioBlkSz, md);
 
             /* Obtain this IO's offset from the
@@ -480,14 +643,14 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
                 size_t adjusted_io_len = yapioBlkSz - io_bytes;
                 off_t adjusted_off = off + io_bytes;
 
-                io_rc = ytc->ytc_write ?
-                    pwrite(yapioFileDesc, adjusted_buf, adjusted_io_len,
-                           adjusted_off) :
+                io_rc = ytc->ytc_read ?
                     pread(yapioFileDesc, adjusted_buf, adjusted_io_len,
-                          adjusted_off);
+                          adjusted_off) :
+                    pwrite(yapioFileDesc, adjusted_buf, adjusted_io_len,
+                           adjusted_off);
 
                 log_msg(YAPIO_LL_DEBUG, "%s rc=%zd %lu",
-                        ytc->ytc_write ? "pwrite" : "pread", io_rc,
+                        ytc->ytc_read ? "pread" : "pwrite", io_rc,
                         adjusted_off);
 
                 if (io_rc > 0)
@@ -503,7 +666,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
                 break;
             }
 
-            if (!ytc->ytc_write)
+            if (ytc->ytc_read)
             {
                 rc = yapio_verify_contents_of_io_buffer(yapioIOBuf, yapioBlkSz,
                                                         md);
@@ -670,7 +833,7 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
 static int
 yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
 {
-    if (!ytc->ytc_skip_mpi_gather)
+    if (ytc->ytc_remote_locality)
     {
         return -EINVAL;
     }
@@ -735,7 +898,7 @@ yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
 static int
 yapio_test_context_setup_mpi_gather(yapio_test_ctx_t *ytc)
 {
-    if (ytc->ytc_skip_mpi_gather)
+    if (!ytc->ytc_remote_locality)
     {
         return -EINVAL;
     }
@@ -772,7 +935,7 @@ yapio_test_context_setup_mpi_gather(yapio_test_ctx_t *ytc)
 static int
 yapio_test_context_setup(yapio_test_ctx_t *ytc)
 {
-    if (ytc->ytc_skip_mpi_gather)
+    if (!ytc->ytc_remote_locality)
     {
         int rc = yapio_test_context_setup_skip_mpi_gather(ytc);
         if (rc)
@@ -790,48 +953,75 @@ yapio_test_context_setup(yapio_test_ctx_t *ytc)
     return 0;
 }
 
-#define YAPIO_SIMPLE_IO_TEST(ctx, write)                            \
-    {                                                               \
-        (ctx)->ytc_leave_holes     = false;                         \
-        (ctx)->ytc_backwards       = false;                         \
-        (ctx)->ytc_skip_mpi_gather = true;                          \
-        (ctx)->ytc_write           = write;                         \
-        (ctx)->ytc_io_pattern      = YAPIO_IOP_SEQUENTIAL;          \
+static void
+yapio_verify_test_contexts(void)
+{
+    if (!yapioNumTestCtxs)
+    {
+        /* Perform the default test - local write followed by local read.
+         */
+        yapioNumTestCtxs = 2;
+        yapio_test_ctx_t *ytc_write = &yapioTestCtxs[0];
+        yapio_test_ctx_t *ytc_read  = &yapioTestCtxs[1];
+
+        ytc_write->ytc_io_pattern = ytc_read->ytc_io_pattern =
+            YAPIO_IOP_SEQUENTIAL;
+
+        ytc_read->ytc_read = 1;
     }
+
+    if (yapio_leader_rank())
+    {
+        int i;
+        for (i = 0; i < yapioNumTestCtxs; i++)
+        {
+            yapio_test_ctx_t *ytc = &yapioTestCtxs[i];
+
+            const char *pattern =
+                (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
+                 (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM ? "R" : "S"));
+
+            log_msg(YAPIO_LL_WARN, "%d: %s%s%s%s%s%s",
+                    i, ytc->ytc_read ? "r" : "w", pattern,
+                    ytc->ytc_remote_locality ? "D" : "L",
+                    ytc->ytc_backwards ? "b" : "",
+                    ytc->ytc_leave_holes ? "h" : "",
+                    ytc->ytc_no_fsync ? "f" : "");
+        }
+    }
+}
+
+static void
+yapio_exec_all_tests(void)
+{
+    int i;
+    for (i = 0; i < yapioNumTestCtxs; i++)
+    {
+        yapio_test_ctx_t *ytc = &yapioTestCtxs[i];
+
+        int rc = yapio_test_context_setup(ytc);
+        if (rc)
+            yapio_exit(rc);
+
+        yapio_perform_io(ytc);
+        yapio_test_ctx_release(ytc);
+    }
+}
 
 int
 main(int argc, char *argv[])
 {
-    yapio_test_ctx_t my_test_ctx;
-
     yapio_mpi_setup(argc, argv);
+
     yapio_getopts(argc, argv);
+
+    yapio_verify_test_contexts();
 
     yapio_setup_buffers();
 
     yapio_setup_test_file();
 
-    memset(&my_test_ctx, 0, sizeof(yapio_test_ctx_t));
-    YAPIO_SIMPLE_IO_TEST(&my_test_ctx, true);
-    my_test_ctx.ytc_io_pattern = YAPIO_IOP_RANDOM;
-//    my_test_ctx.ytc_backwards = true;
-    int rc = yapio_test_context_setup(&my_test_ctx);
-    if (rc)
-        yapio_exit(YAPIO_EXIT_ERR);
-
-    yapio_perform_io(&my_test_ctx);
-
-    yapio_test_ctx_release(&my_test_ctx);
-
-    YAPIO_SIMPLE_IO_TEST(&my_test_ctx, false);
-    my_test_ctx.ytc_io_pattern = YAPIO_IOP_RANDOM;
-//    my_test_ctx.ytc_backwards = true;
-    rc = yapio_test_context_setup(&my_test_ctx);
-    if (rc)
-        yapio_exit(YAPIO_EXIT_ERR);
-
-    yapio_perform_io(&my_test_ctx);
-    yapio_test_ctx_release(&my_test_ctx);
+    yapio_exec_all_tests();
 
     yapio_close_test_file();
 
