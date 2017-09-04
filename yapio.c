@@ -826,12 +826,12 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
 }
 
 /**
- * yapio_test_context_setup_skip_mpi_gather - setup driver for the 'local' I/O
+ * yapio_test_context_setup_local - setup driver for the 'local' I/O
  *    mode where each rank determines its own work queue.
  * Note: YAPIO_IOP_STRIDED mode is not supported in this mode.
  */
 static int
-yapio_test_context_setup_skip_mpi_gather(yapio_test_ctx_t *ytc)
+yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
 {
     if (ytc->ytc_remote_locality)
     {
@@ -937,11 +937,11 @@ yapio_test_context_setup(yapio_test_ctx_t *ytc)
 {
     if (!ytc->ytc_remote_locality)
     {
-        int rc = yapio_test_context_setup_skip_mpi_gather(ytc);
+        int rc = yapio_test_context_setup_local(ytc);
         if (rc)
         {
             log_msg(YAPIO_LL_ERROR,
-                    "yapio_test_context_setup_skip_mpi_gather: %s",
+                    "yapio_test_context_setup_local: %s",
                     strerror(-rc));
 
             yapio_test_ctx_release(ytc);
