@@ -23,7 +23,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:kt:"
+#define YAPIO_OPTS "b:n:hd:p:kt:P"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -60,6 +60,7 @@ static char       *yapioFilePrefix     = YAPIO_DEFAULT_FILE_PREFIX;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioKeepFile       = false;
+static bool        yapioPolluteBlks    = false;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
 static char        yapioTestFileName[PATH_MAX + 1];
@@ -156,6 +157,14 @@ yapio_leader_rank(void)
 {
     return yapioMyRank == 0 ? true : false;
 }
+
+#if 0
+static bool
+yapio_rank_sends_then_recvs(void)
+{
+    return (yapioMyRank % 1) ? true : false;
+}
+#endif
 
 #define log_msg(lvl, message, ...)                                  \
     {                                                               \
@@ -271,14 +280,13 @@ yapio_parse_test_recipe(const char *recipe_str)
             break;
 
         case 'L':
-            if (++locality)
+            if (!++locality)
                 yapioTestCtxs[test_ctx_idx].ytc_remote_locality = 0;
             break;
         case 'D':
-            if (++locality)
+            if (!++locality)
                 yapioTestCtxs[test_ctx_idx].ytc_remote_locality = 1;
             break;
-
         case 'b':
             yapioTestCtxs[test_ctx_idx].ytc_backwards = 1;
             break;
@@ -377,6 +385,9 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'p':
             yapioFilePrefix = optarg;
+            break;
+        case 'P':
+            yapioPolluteBlks = true;
             break;
         case 't':
             if (yapio_parse_test_recipe(optarg))
@@ -785,16 +796,27 @@ yapio_test_context_alloc_rank(yapio_test_ctx_t *ytc,
                               enum yapio_test_ctx_mdh_in_out in_out,
                               int rank_idx, size_t nblks)
 {
+    if (in_out >= YAPIO_TEST_CTX_MDH_MAX)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
     yapio_test_ctx_md_t *ytcmh = &ytc->ytc_in_out_md_ops[in_out];
 
     if (!ytcmh->ytcmh_num_ops)
+    {
         ytcmh->ytcmh_num_ops = calloc(yapioNumRanks, sizeof(int));
+        if (!ytcmh->ytcmh_num_ops)
+            return NULL;
+    }
 
     if (!ytcmh->ytcmh_ops)
+    {
         ytcmh->ytcmh_ops = calloc(yapioNumRanks, sizeof(yapio_blk_md_t *));
-
-    if (!ytcmh->ytcmh_num_ops || !ytcmh->ytcmh_ops)
-        return NULL;
+        if (!ytcmh->ytcmh_ops)
+            return NULL;
+    }
 
     ytcmh->ytcmh_num_ops[rank_idx] = nblks;
     ytcmh->ytcmh_ops[rank_idx] = calloc(nblks, sizeof(yapio_blk_md_t));
@@ -807,9 +829,14 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
                                              int rank_idx)
 {
     int num_ops = 0;
+
+    /* The local mode test case does not require the 'MDH_OUT' buffers at all.
+     */
+    enum yapio_test_ctx_mdh_in_out in_out = ytc->ytc_remote_locality ?
+        YAPIO_TEST_CTX_MDH_OUT : YAPIO_TEST_CTX_MDH_IN;
+
     yapio_blk_md_t *md =
-        yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN, rank_idx,
-                                   &num_ops);
+        yapio_test_ctx_to_md_array(ytc, in_out, rank_idx, &num_ops);
 
     if (!md)
         log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank_idx);
@@ -820,7 +847,7 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
         unsigned src_idx = ytc->ytc_backwards ? num_ops - i - 1 : i;
 
         md[i] = yapioSourceBlkMd[src_idx];
-        log_msg(YAPIO_LL_TRACE, "rank=%d md->ybm_blk_number=%zd",
+        log_msg(YAPIO_LL_TRACE, "writer_rank=%d md->ybm_blk_number=%zd",
                 md[i].ybm_writer_rank, md[i].ybm_blk_number);
     }
 }
@@ -857,7 +884,7 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
                                       yapioNumBlksPerRank);
 
     if (!md)
-        return -ENOMEM;
+        return -errno;
 
     if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
     {
@@ -894,35 +921,57 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
     return 0;
 }
 
-#if 0
 static int
-yapio_test_context_setup_mpi_gather(yapio_test_ctx_t *ytc)
+yapio_test_context_setup_distributed(yapio_test_ctx_t *ytc)
 {
     if (!ytc->ytc_remote_locality)
     {
         return -EINVAL;
     }
+#if 0 //disable random and strided for now
     else if (ytc->ytc_io_pattern != YAPIO_IOP_SEQUENTIAL &&
              ytc->ytc_io_pattern != YAPIO_IOP_RANDOM &&
              ytc->ytc_io_pattern != YAPIO_IOP_STRIDED)
+#else
+    else if (ytc->ytc_io_pattern != YAPIO_IOP_SEQUENTIAL)
+#endif
     {
         log_msg(YAPIO_LL_WARN, "unknown io_pattern=%d", ytc->ytc_io_pattern);
         return -EBADRQC;
     }
 
+    int rc = 0;
     if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
     {
         /* Shift the blocks by one rank.
          */
-        int rank_idx = (yapioMyRank + 1) % yapioNumRanks;
+        int src_idx = yapioMyRank ? yapioMyRank - 1 : yapioNumRanks - 1;
+        int dest_idx = (yapioMyRank == yapioNumRanks - 1) ?
+            0 : yapioMyRank + 1;
 
-        if (!yapio_test_context_alloc_rank(ytc, rank_idx, yapioNumBlksPerRank))
-            return -ENOMEM;
+        yapio_blk_md_t *md_dest =
+            yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                          dest_idx, yapioNumBlksPerRank);
+        yapio_blk_md_t *md_src =
+           yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                         yapioMyRank, yapioNumBlksPerRank);
 
-        yapio_test_context_sequential_setup_for_rank(ytc, rank_idx);
+        yapio_test_context_sequential_setup_for_rank(ytc, dest_idx);
+
+        int send_recv_cnt = sizeof(yapio_blk_md_t) * yapioNumBlksPerRank;
+        int send_recv_tag = YAPIO_IOP_SEQUENTIAL;
+        MPI_Status status;
+
+        log_msg(YAPIO_LL_TRACE, "dest_idx=%d src_idx=%d", dest_idx, src_idx);
+
+        rc = MPI_Sendrecv((void *)md_dest, send_recv_cnt, MPI_BYTE, dest_idx,
+                          send_recv_tag, (void *)md_src, send_recv_cnt,
+                          MPI_BYTE, src_idx, send_recv_tag, MPI_COMM_WORLD,
+                          &status);
     }
+
+    return rc;
 }
-#endif
 
 /**
  * yapio_test_context_setup - Allocates memory buffers for the test according
@@ -935,19 +984,20 @@ yapio_test_context_setup_mpi_gather(yapio_test_ctx_t *ytc)
 static int
 yapio_test_context_setup(yapio_test_ctx_t *ytc)
 {
-    if (!ytc->ytc_remote_locality)
+    int rc = ytc->ytc_remote_locality ?
+        yapio_test_context_setup_distributed(ytc) :
+        yapio_test_context_setup_local(ytc);
+
+    if (rc)
     {
-        int rc = yapio_test_context_setup_local(ytc);
-        if (rc)
-        {
-            log_msg(YAPIO_LL_ERROR,
-                    "yapio_test_context_setup_local: %s",
-                    strerror(-rc));
+        log_msg(YAPIO_LL_ERROR,
+                "yapio_test_context_setup_%s: %s",
+                ytc->ytc_remote_locality ? "distributed" : "local",
+                strerror(-rc));
 
-            yapio_test_ctx_release(ytc);
+        yapio_test_ctx_release(ytc);
 
-            return rc;
-        }
+        return rc;
     }
 
     return 0;
@@ -958,6 +1008,7 @@ yapio_verify_test_contexts(void)
 {
     if (!yapioNumTestCtxs)
     {
+        log_msg(YAPIO_LL_DEBUG, "Using default tests");
         /* Perform the default test - local write followed by local read.
          */
         yapioNumTestCtxs = 2;
