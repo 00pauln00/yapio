@@ -23,7 +23,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:kt:P"
+#define YAPIO_OPTS "b:n:hd:p:kt:PD:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -32,6 +32,7 @@
 #define YAPIO_DEFAULT_FILE_PREFIX  "yapio."
 #define YAPIO_MKSTEMP_TEMPLATE     "XXXXXX"
 #define YAPIO_MKSTEMP_TEMPLATE_LEN 6
+#define YAPIO_DECOMPOSE_MAX        8
 
 enum yapio_log_levels
 {
@@ -61,6 +62,7 @@ static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioKeepFile       = false;
 static bool        yapioPolluteBlks    = false;
+static int         yapioDecomposeTest  = 0;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
 static char        yapioTestFileName[PATH_MAX + 1];
@@ -370,6 +372,9 @@ yapio_getopts(int argc, char **argv)
         {
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
+            break;
+        case 'D':
+            yapioDecomposeTest = MAX(atoi(optarg), YAPIO_DECOMPOSE_MAX);
             break;
         case 'd':
             yapioDbgLevel = MIN(atoi(optarg), YAPIO_LL_MAX);
