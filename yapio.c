@@ -926,6 +926,45 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
     return 0;
 }
 
+/**
+ * yapio_test_context_setup_distributed_sequential - Function which handles the
+ *    exchange of blk metadata on behalf of a distributed, sequential
+ *    operation.  The distribution method is to send the entire blk metadata
+ *    set to 'my_rank + 1' and receive from 'my_rank -1'.
+ */
+static int
+yapio_test_context_setup_distributed_sequential(yapio_test_ctx_t *ytc)
+{
+    int src_rank = yapioMyRank ? yapioMyRank - 1 : yapioNumRanks - 1;
+    int dest_rank = (yapioMyRank == yapioNumRanks - 1) ?
+        0 : yapioMyRank + 1;
+
+    yapio_blk_md_t *md_dest =
+        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                      dest_rank, yapioNumBlksPerRank);
+    yapio_blk_md_t *md_src =
+        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                      yapioMyRank, yapioNumBlksPerRank);
+
+    yapio_test_context_sequential_setup_for_rank(ytc, dest_rank);
+
+    int send_recv_cnt = sizeof(yapio_blk_md_t) * yapioNumBlksPerRank;
+    int send_recv_tag = YAPIO_IOP_SEQUENTIAL;
+    MPI_Status status; //unused
+
+    log_msg(YAPIO_LL_TRACE, "dest_idx=%d src_idx=%d", dest_rank, src_rank);
+
+    int rc = MPI_Sendrecv((void *)md_dest, send_recv_cnt, MPI_BYTE, dest_rank,
+                          send_recv_tag, (void *)md_src, send_recv_cnt,
+                          MPI_BYTE, src_rank, send_recv_tag, MPI_COMM_WORLD,
+                          &status);
+
+    if (rc != MPI_SUCCESS)
+        log_msg(YAPIO_LL_ERROR, "MPI_Sendrecv: %d", rc);
+
+    return rc;
+}
+
 static int
 yapio_test_context_setup_distributed(yapio_test_ctx_t *ytc)
 {
@@ -948,33 +987,11 @@ yapio_test_context_setup_distributed(yapio_test_ctx_t *ytc)
     int rc = 0;
     if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
     {
-        /* Shift the blocks by one rank.
-         */
-        int src_idx = yapioMyRank ? yapioMyRank - 1 : yapioNumRanks - 1;
-        int dest_idx = (yapioMyRank == yapioNumRanks - 1) ?
-            0 : yapioMyRank + 1;
-
-        yapio_blk_md_t *md_dest =
-            yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
-                                          dest_idx, yapioNumBlksPerRank);
-        yapio_blk_md_t *md_src =
-           yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN,
-                                         yapioMyRank, yapioNumBlksPerRank);
-
-        yapio_test_context_sequential_setup_for_rank(ytc, dest_idx);
-
-        int send_recv_cnt = sizeof(yapio_blk_md_t) * yapioNumBlksPerRank;
-        int send_recv_tag = YAPIO_IOP_SEQUENTIAL;
-        MPI_Status status;
-
-        log_msg(YAPIO_LL_TRACE, "dest_idx=%d src_idx=%d", dest_idx, src_idx);
-
-        rc = MPI_Sendrecv((void *)md_dest, send_recv_cnt, MPI_BYTE, dest_idx,
-                          send_recv_tag, (void *)md_src, send_recv_cnt,
-                          MPI_BYTE, src_idx, send_recv_tag, MPI_COMM_WORLD,
-                          &status);
+        rc = yapio_test_context_setup_distributed_sequential(ytc);
     }
-
+    else if (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM)
+    {
+    }
     return rc;
 }
 
