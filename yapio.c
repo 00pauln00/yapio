@@ -1016,30 +1016,35 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     if (!md_recv)
         return -errno;
 
+    yapio_blk_md_t *md_send =
+        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                      yapioMyRank,
+                                      yapioNumBlksPerRank);
+    if (!md_send)
+        return -errno;
+
     const bool strided =
         ytc->ytc_io_pattern == YAPIO_IOP_STRIDED ? true : false;
 
-    yapio_blk_md_t *md_strided;
     if (strided)
     {
-        md_strided = yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
-                                                   yapioMyRank,
-                                                   yapioNumBlksPerRank);
-
         int nblks_div_nranks = yapioNumBlksPerRank / yapioNumRanks;
         int i, j, total = 0;
         for (i = 0, total = 0; i < yapioNumRanks; i++)
             for (j = 0; j < nblks_div_nranks; j++, total++)
-                md_strided[total] =
-                    yapioSourceBlkMd[(yapioNumRanks * j) + i];
+                md_send[total] = yapioSourceBlkMd[(yapioNumRanks * j) + i];
+    }
+    else
+    {
+        yapio_blk_md_randomize(yapioSourceBlkMd, md_send,
+                               yapioNumBlksPerRank, true);
     }
 
     int send_recv_cnt = ((yapioNumBlksPerRank / yapioNumRanks) *
                          sizeof(yapio_blk_md_t));
 
-    int rc = MPI_Alltoall(strided ? md_strided : yapioSourceBlkMd,
-                          send_recv_cnt, MPI_BYTE, md_recv, send_recv_cnt,
-                          MPI_BYTE, MPI_COMM_WORLD);
+    int rc = MPI_Alltoall(md_send, send_recv_cnt, MPI_BYTE,
+                          md_recv, send_recv_cnt, MPI_BYTE, MPI_COMM_WORLD);
     if (rc != MPI_SUCCESS)
     {
         log_msg(YAPIO_LL_ERROR, "MPI_Alltoall: %d", rc);
