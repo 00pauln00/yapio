@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <time.h>
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -142,18 +143,6 @@ yapio_ll_to_string(enum yapio_log_levels yapio_ll)
     return "debug";
 }
 
-static void
-yapio_exit(int exit_rc)
-{
-    if (yapioMpiInit)
-    {
-        MPI_Barrier(MPI_COMM_WORLD);
-        MPI_Finalize();
-    }
-
-    exit(exit_rc);
-}
-
 static bool
 yapio_leader_rank(void)
 {
@@ -177,6 +166,68 @@ yapio_leader_rank(void)
         if (yapio_leader_rank())                \
             log_msg(lvl, message, ##__VA_ARGS__);   \
     }
+
+static void
+yapio_exit(int exit_rc)
+{
+    if (yapioMpiInit)
+    {
+        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Finalize();
+    }
+
+    exit(exit_rc);
+}
+
+/* Timer related calls.
+ */
+#define YAPIO_NSEC_PER_SEC 1000000000L
+#define YAPIO_USEC_PER_SEC 1000000L
+
+#define YAPIO_TIME_PRINT_SPEC "%.4f"
+#define YAPIO_TIMER_ARGS(timer)                                         \
+    (float)((timer)->tv_sec +                                           \
+            (float)((float)(timer)->tv_nsec / YAPIO_NSEC_PER_SEC))
+
+typedef struct timespec yapio_timer_t;
+
+/**
+ * yapio_get_time - wrapper for clock_gettime()
+ */
+static void
+yapio_get_time(yapio_timer_t *yt)
+{
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, yt))
+        log_msg(YAPIO_LL_FATAL, "clock_gettime: %s", strerror(errno));
+}
+
+/**
+ * yapio_start_timer - starts a 'timer'.
+ */
+static void
+yapio_start_timer(yapio_timer_t *timer)
+{
+    yapio_get_time(timer);
+}
+/**
+ * yapio_get_time_duration - take end timestamp and subtract it from the value
+ *    in 'timer', leaving the elapsed time.
+ */
+static void
+yapio_get_time_duration(yapio_timer_t *result, const yapio_timer_t *end)
+{
+    result->tv_sec = end->tv_sec - result->tv_sec;
+    result->tv_nsec = end->tv_nsec - result->tv_nsec;
+
+    if (result->tv_nsec < 0)
+    {
+        result->tv_sec--;
+        result->tv_nsec += YAPIO_NSEC_PER_SEC;
+    }
+
+    if (result->tv_nsec < 0 || result->tv_nsec >= YAPIO_NSEC_PER_SEC)
+        result->tv_nsec = 0;
+}
 
 static void
 yapio_print_help(int exit_val)
@@ -1170,25 +1221,37 @@ yapio_exec_all_tests(void)
         if (rc)
             yapio_exit(rc);
 
+        yapio_timer_t test_duration, barrier_wait[2];
+        /* Sync all ranks before and after starting the test.
+         */
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (yapio_leader_rank())
+            yapio_start_timer(&test_duration);
+
+        yapio_perform_io(ytc);
+
+        yapio_start_timer(&barrier_wait[0]);
+        MPI_Barrier(MPI_COMM_WORLD);
+        yapio_start_timer(&barrier_wait[1]);
+
+        /* Result is in barrier[0]
+         */
+        yapio_get_time_duration(&barrier_wait[0], &barrier_wait[1]);
+
+        if (yapio_leader_rank())
+            yapio_get_time_duration(&test_duration, &barrier_wait[1]);
+
         const char *pattern =
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM ? "R" : "S"));
 
-        log_msg_r0(YAPIO_LL_WARN, "%d: %s%s%s%s%s%s",
+        log_msg_r0(YAPIO_LL_WARN, "%d: %s%s%s%s%s%s <"YAPIO_TIME_PRINT_SPEC">",
                    i, ytc->ytc_read ? "r" : "w", pattern,
                    ytc->ytc_remote_locality ? "D" : "L",
                    ytc->ytc_backwards ? "b" : "",
                    ytc->ytc_leave_holes ? "h" : "",
-                   ytc->ytc_no_fsync ? "f" : "");
-
-        /* Sync all ranks before and after starting the test.
-         */
-        MPI_Barrier(MPI_COMM_WORLD);
-
-        yapio_perform_io(ytc);
-
-        MPI_Barrier(MPI_COMM_WORLD);
-
+                   ytc->ytc_no_fsync ? "f" : "",
+                   YAPIO_TIMER_ARGS(&test_duration));
         /* Free memory allocated in the test.
          */
         yapio_test_ctx_release(ytc);
