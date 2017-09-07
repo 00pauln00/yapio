@@ -884,7 +884,7 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
             md_out[i] = md_in[i];
     }
 
-    /* Swap output array items based on the random data in the array/
+    /* Swap output array items based on the random data in the array.
      */
     for (i = 0; i < num_mds; i++)
     {
@@ -1015,14 +1015,17 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     const bool strided =
         ytc->ytc_io_pattern == YAPIO_IOP_STRIDED ? true : false;
 
+    size_t src_idx;
+    const int nblks_div_nranks = yapioNumBlksPerRank / yapioNumRanks;
+
     if (strided)
     {
-        int nblks_div_nranks = yapioNumBlksPerRank / yapioNumRanks;
+
         int i, j, total = 0;
         for (i = 0, total = 0; i < yapioNumRanks; i++)
             for (j = 0; j < nblks_div_nranks; j++, total++)
             {
-                size_t src_idx = (yapioNumRanks * j) + i;
+                src_idx = (yapioNumRanks * j) + i;
 #if 0 //backwards + strided is broken
                 if (ytc->ytc_backwards)
                     src_idx = (yapioNumRanks * (nblks_div_nranks - j) - 1 + i);
@@ -1038,10 +1041,20 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     {
         yapio_blk_md_randomize(yapioSourceBlkMd, md_send,
                                yapioNumBlksPerRank, true);
+
+        if (!ytc->ytc_read)
+        {
+            for (src_idx = 0; src_idx < yapioNumBlksPerRank; src_idx++)
+            {
+                int rank = src_idx / nblks_div_nranks;
+
+                yapio_source_md_update_writer_rank(src_idx, rank);
+                md_send[src_idx].ybm_writer_rank = rank;
+            }
+        }
     }
 
-    int send_recv_cnt = ((yapioNumBlksPerRank / yapioNumRanks) *
-                         sizeof(yapio_blk_md_t));
+    int send_recv_cnt = nblks_div_nranks * sizeof(yapio_blk_md_t);
 
     int rc = MPI_Alltoall(md_send, send_recv_cnt, MPI_BYTE,
                           md_recv, send_recv_cnt, MPI_BYTE, MPI_COMM_WORLD);
