@@ -88,7 +88,7 @@ typedef struct yapio_blk_metadata
 {
     int    ybm_writer_rank;     //rank who has last written this block
     int    ybm_write_iteration; //iteration number of last write
-    size_t ybm_blk_number;      //number of the block
+    size_t ybm_blk_number;      //number of the block - should not change!
 } yapio_blk_md_t;
 
 yapio_blk_md_t  *yapioSourceBlkMd; //metadata which this rank maintains
@@ -159,14 +159,6 @@ yapio_leader_rank(void)
 {
     return yapioMyRank == 0 ? true : false;
 }
-
-#if 0
-static bool
-yapio_rank_sends_then_recvs(void)
-{
-    return (yapioMyRank % 1) ? true : false;
-}
-#endif
 
 #define log_msg(lvl, message, ...)                                  \
     {                                                               \
@@ -533,17 +525,15 @@ yapio_initialize_source_md_buffer(void)
     }
 }
 
-#if 0
 static void
-yapio_source_md_update_writer_rank(int source_md_idx, int new_writer_rank)
+yapio_source_md_update_writer_rank(size_t source_md_idx, int new_writer_rank)
 {
     if (source_md_idx >= yapioNumBlksPerRank)
-        log_msg(YAPIO_LL_FATAL, "out of bounds source_md_idx=%d",
+        log_msg(YAPIO_LL_FATAL, "out of bounds source_md_idx=%zu",
                 source_md_idx);
 
     yapioSourceBlkMd[source_md_idx].ybm_writer_rank = new_writer_rank;
 }
-#endif
 
 static unsigned long long
 yapio_get_content_word(const yapio_blk_md_t *md, size_t word_num)
@@ -843,7 +833,7 @@ yapio_test_context_alloc_rank(yapio_test_ctx_t *ytc,
 
 static void
 yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
-                                             int rank_idx)
+                                             int rank)
 {
     int num_ops = 0;
 
@@ -853,19 +843,18 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
         YAPIO_TEST_CTX_MDH_OUT : YAPIO_TEST_CTX_MDH_IN;
 
     yapio_blk_md_t *md =
-        yapio_test_ctx_to_md_array(ytc, in_out, rank_idx, &num_ops);
+        yapio_test_ctx_to_md_array(ytc, in_out, rank, &num_ops);
 
     if (!md)
-        log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank_idx);
+        log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank);
 
     int i;
     for (i = 0; i < num_ops; i++)
     {
-        unsigned src_idx = ytc->ytc_backwards ? num_ops - i - 1 : i;
+        size_t src_idx = ytc->ytc_backwards ? num_ops - i - 1 : i;
 
-//XXX yapioSourceBlkMd needs to be updated for with rank # when write mode
-//    is !ytc_read.
-// yapio_source_md_update_writer_rank(src_idx, rank_idx);
+        if (!ytc->ytc_read)
+            yapio_source_md_update_writer_rank(src_idx, rank);
 
         md[i] = yapioSourceBlkMd[src_idx];
         log_msg(YAPIO_LL_TRACE, "writer_rank=%d md->ybm_blk_number=%zd",
@@ -1032,7 +1021,18 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
         int i, j, total = 0;
         for (i = 0, total = 0; i < yapioNumRanks; i++)
             for (j = 0; j < nblks_div_nranks; j++, total++)
-                md_send[total] = yapioSourceBlkMd[(yapioNumRanks * j) + i];
+            {
+                size_t src_idx = (yapioNumRanks * j) + i;
+#if 0 //backwards + strided is broken
+                if (ytc->ytc_backwards)
+                    src_idx = (yapioNumRanks * (nblks_div_nranks - j) - 1 + i);
+#endif
+
+                if (!ytc->ytc_read)
+                    yapio_source_md_update_writer_rank(src_idx, i);
+
+                md_send[total] = yapioSourceBlkMd[src_idx];
+            }
     }
     else
     {
