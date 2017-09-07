@@ -623,8 +623,6 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
     int rc = 0;
     int i;
 
-    MPI_Barrier(MPI_COMM_WORLD);
-
     for (i = 0; i < yapioNumRanks; i++)
     {
         int rank_idx = ytc->ytc_backwards ? (yapioNumRanks - i - 1) : i;
@@ -703,8 +701,6 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
             log_msg(YAPIO_LL_ERROR, "fsync(): %s", strerror(errno));
         }
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
 
     /* Increment the test iteration
      */
@@ -1178,15 +1174,23 @@ yapio_exec_all_tests(void)
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM ? "R" : "S"));
 
-        log_msg_r0(YAPIO_LL_DEBUG, "%d: %s%s%s%s%s%s",
+        log_msg_r0(YAPIO_LL_WARN, "%d: %s%s%s%s%s%s",
                    i, ytc->ytc_read ? "r" : "w", pattern,
                    ytc->ytc_remote_locality ? "D" : "L",
                    ytc->ytc_backwards ? "b" : "",
                    ytc->ytc_leave_holes ? "h" : "",
                    ytc->ytc_no_fsync ? "f" : "");
 
+        /* Sync all ranks before and after starting the test.
+         */
+        MPI_Barrier(MPI_COMM_WORLD);
 
         yapio_perform_io(ytc);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        /* Free memory allocated in the test.
+         */
         yapio_test_ctx_release(ytc);
     }
 }
