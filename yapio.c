@@ -24,7 +24,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:kt:PD:"
+#define YAPIO_OPTS "b:n:hd:p:kt:PD:B"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -63,6 +63,7 @@ static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioKeepFile       = false;
 static bool        yapioPolluteBlks    = false;
+static bool        yapioBarrierStats   = false;
 static int         yapioDecomposeTest  = 0;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
@@ -184,7 +185,7 @@ yapio_exit(int exit_rc)
 #define YAPIO_NSEC_PER_SEC 1000000000L
 #define YAPIO_USEC_PER_SEC 1000000L
 
-#define YAPIO_TIME_PRINT_SPEC "%.4f"
+#define YAPIO_TIME_PRINT_SPEC "%.5f"
 #define YAPIO_TIMER_ARGS(timer)                                         \
     (float)((timer)->tv_sec +                                           \
             (float)((float)(timer)->tv_nsec / YAPIO_NSEC_PER_SEC))
@@ -236,6 +237,7 @@ yapio_print_help(int exit_val)
         fprintf(exit_val ? stderr : stdout,
                 "%s [OPTION] DIRECTORY\n\n"
                 "Options:\n"
+                "\t-B    Display barrier wait stats\n"
                 "\t-b    Block size\n"
                 "\t-d    Debugging level\n"
                 "\t-h    Print help message\n"
@@ -413,6 +415,9 @@ yapio_getopts(int argc, char **argv)
     {
         switch (opt)
         {
+        case 'B':
+            yapioBarrierStats = true;
+            break;
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
             break;
@@ -1209,6 +1214,91 @@ yapio_verify_test_contexts(void)
     }
 }
 
+enum yapio_barrier_stats
+{
+    YAPIO_BARRIER_STATS_AVG  = 0,
+    YAPIO_BARRIER_STATS_MAX  = 1,
+    YAPIO_BARRIER_STATS_MED = 2,
+    YAPIO_BARRIER_STATS_LAST = 3
+};
+
+static float
+yapio_timer_to_float(const yapio_timer_t *timer)
+{
+    float bwait = timer->tv_sec + (float)((float)timer->tv_nsec /
+                                          YAPIO_NSEC_PER_SEC);
+
+    return bwait;
+}
+
+static int
+yapio_gather_barrier_stats_median_cmp(const void *a, const void *b)
+{
+    float a_val = yapio_timer_to_float((const yapio_timer_t *)a);
+    float b_val = yapio_timer_to_float((const yapio_timer_t *)b);
+
+    if (a_val > b_val)
+        return 1;
+    else if (a_val < b_val)
+        return -1;
+
+    return 0;
+}
+
+static void
+yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
+                           float *barrier_global_results,
+                           int *barrier_max_rank)
+{
+    yapio_timer_t *all_barrier_timers = NULL;
+
+    if (barrier_global_results)
+    {
+        /* This node is rank0 and will gather the timers for reporting.
+         */
+        all_barrier_timers = calloc(yapioNumRanks, sizeof(yapio_timer_t));
+
+        if (!all_barrier_timers)
+            log_msg(YAPIO_LL_FATAL, "calloc: %s", strerror(ENOMEM));
+    }
+
+    int rc = MPI_Gather(barrier_timer_this_rank, sizeof(yapio_timer_t),
+                        MPI_BYTE, all_barrier_timers, sizeof(yapio_timer_t),
+                        MPI_BYTE, 0, MPI_COMM_WORLD);
+
+    if (rc != MPI_SUCCESS)
+        log_msg(YAPIO_LL_FATAL, "MPI_Gather: error=%d", rc);
+
+    if (barrier_global_results)
+    {
+        *barrier_max_rank = -1;
+        barrier_global_results[YAPIO_BARRIER_STATS_MAX] = 0.0;
+        barrier_global_results[YAPIO_BARRIER_STATS_AVG] = 0.0;
+
+        int i;
+        for (i = 0; i < yapioNumRanks; i++)
+        {
+            float bwait = yapio_timer_to_float(&all_barrier_timers[i]);
+
+            barrier_global_results[YAPIO_BARRIER_STATS_AVG] += bwait;
+
+            if (bwait > barrier_global_results[YAPIO_BARRIER_STATS_MAX])
+            {
+                barrier_global_results[YAPIO_BARRIER_STATS_MAX] = bwait;
+                *barrier_max_rank = i;
+            }
+        }
+
+        barrier_global_results[YAPIO_BARRIER_STATS_AVG] /= yapioNumRanks;
+
+        qsort((void *)all_barrier_timers, (size_t)yapioNumRanks,
+              sizeof(yapio_timer_t), yapio_gather_barrier_stats_median_cmp);
+
+        barrier_global_results[YAPIO_BARRIER_STATS_MED] =
+            yapio_timer_to_float(&all_barrier_timers[yapioNumRanks / 2]);
+    }
+}
+
 static void
 yapio_exec_all_tests(void)
 {
@@ -1237,21 +1327,45 @@ yapio_exec_all_tests(void)
         /* Result is in barrier[0]
          */
         yapio_get_time_duration(&barrier_wait[0], &barrier_wait[1]);
+        yapio_get_time_duration(&test_duration, &barrier_wait[1]);
 
-        if (yapio_leader_rank())
-            yapio_get_time_duration(&test_duration, &barrier_wait[1]);
+        if (!yapio_leader_rank())
+        {
+            if (yapioBarrierStats)
+                yapio_gather_barrier_stats(&barrier_wait[0], NULL, NULL);
+        }
+        else
+        {
+            fprintf(stdout, "%d: %s%s%s%s%s%s <"YAPIO_TIME_PRINT_SPEC">%s",
+                    i,
+                    (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
+                     (ytc->ytc_io_pattern ==
+                      YAPIO_IOP_RANDOM ? "R" : "S")),
+                    ytc->ytc_read            ? "r" : "w",
+                    ytc->ytc_remote_locality ? "D" : "L",
+                    ytc->ytc_backwards       ? "b" : " ",
+                    ytc->ytc_leave_holes     ? "h" : " ",
+                    ytc->ytc_no_fsync        ? "f" : " ",
+                    YAPIO_TIMER_ARGS(&test_duration),
+                    yapioBarrierStats ? "" : "\n");
 
-        const char *pattern =
-            (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
-             (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM ? "R" : "S"));
+            if (yapioBarrierStats)
+            {
+                float barrier_results[YAPIO_BARRIER_STATS_LAST];
+                int   barrier_max_rank;
 
-        log_msg_r0(YAPIO_LL_WARN, "%d: %s%s%s%s%s%s <"YAPIO_TIME_PRINT_SPEC">",
-                   i, ytc->ytc_read ? "r" : "w", pattern,
-                   ytc->ytc_remote_locality ? "D" : "L",
-                   ytc->ytc_backwards ? "b" : "",
-                   ytc->ytc_leave_holes ? "h" : "",
-                   ytc->ytc_no_fsync ? "f" : "",
-                   YAPIO_TIMER_ARGS(&test_duration));
+                yapio_gather_barrier_stats(&barrier_wait[0], barrier_results,
+                                           &barrier_max_rank);
+
+                fprintf(stdout, " <%d:"YAPIO_TIME_PRINT_SPEC", "
+                        YAPIO_TIME_PRINT_SPEC", "YAPIO_TIME_PRINT_SPEC">\n",
+                        barrier_max_rank,
+                        barrier_results[YAPIO_BARRIER_STATS_MAX],
+                        barrier_results[YAPIO_BARRIER_STATS_AVG],
+                        barrier_results[YAPIO_BARRIER_STATS_MED]);
+            }
+        }
+
         /* Free memory allocated in the test.
          */
         yapio_test_ctx_release(ytc);
