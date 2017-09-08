@@ -24,7 +24,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:kt:PD:B"
+#define YAPIO_OPTS "b:n:hd:p:kt:PD:s"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -63,7 +63,7 @@ static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioKeepFile       = false;
 static bool        yapioPolluteBlks    = false;
-static bool        yapioBarrierStats   = false;
+static bool        yapioDisplayStats   = false;
 static int         yapioDecomposeTest  = 0;
 static const char *yapioExecName;
 static const char *yapioTestRootDir;
@@ -185,7 +185,7 @@ yapio_exit(int exit_rc)
 #define YAPIO_NSEC_PER_SEC 1000000000L
 #define YAPIO_USEC_PER_SEC 1000000L
 
-#define YAPIO_TIME_PRINT_SPEC "%.5f"
+#define YAPIO_TIME_PRINT_SPEC "%.4f"
 #define YAPIO_TIMER_ARGS(timer)                                         \
     (float)((timer)->tv_sec +                                           \
             (float)((float)(timer)->tv_nsec / YAPIO_NSEC_PER_SEC))
@@ -237,16 +237,16 @@ yapio_print_help(int exit_val)
         fprintf(exit_val ? stderr : stdout,
                 "%s [OPTION] DIRECTORY\n\n"
                 "Options:\n"
-                "\t-B    Display barrier wait stats\n"
                 "\t-b    Block size\n"
                 "\t-d    Debugging level\n"
                 "\t-h    Print help message\n"
                 "\t-k    Keep file after test completion\n"
                 "\t-n    Number of blocks per task\n"
                 "\t-p    File name prefix\n"
+                "\t-s    Display test duration and barrier wait times\n"
                 "\t-t    Test description\n"
-                "\t      - I/O Op:   read (r), write (w)\n"
                 "\t      - Pattern:  sequential (s), random (R), strided (S)\n"
+                "\t      - I/O Op:   read (r), write (w)\n"
                 "\t      - Locality: local (L), distributed (D)\n"
                 "\t      - Options:  backwards (b), holes (h), no-fsync (f)\n"
                 "\n\t      Example: -t wsL,rRD\n"
@@ -415,9 +415,6 @@ yapio_getopts(int argc, char **argv)
     {
         switch (opt)
         {
-        case 'B':
-            yapioBarrierStats = true;
-            break;
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
             break;
@@ -441,6 +438,9 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'P':
             yapioPolluteBlks = true;
+            break;
+        case 's':
+            yapioDisplayStats = true;
             break;
         case 't':
             if (yapio_parse_test_recipe(optarg))
@@ -1331,12 +1331,38 @@ yapio_exec_all_tests(void)
 
         if (!yapio_leader_rank())
         {
-            if (yapioBarrierStats)
+            if (yapioDisplayStats)
                 yapio_gather_barrier_stats(&barrier_wait[0], NULL, NULL);
         }
         else
         {
-            fprintf(stdout, "%d: %s%s%s%s%s%s <"YAPIO_TIME_PRINT_SPEC">%s",
+            float bandwidth =
+                (float)(((float)yapioNumRanks * yapioNumBlksPerRank *
+                         yapioBlkSz) / yapio_timer_to_float(&test_duration));
+
+            char *unit_str;
+            if (bandwidth < (1ULL << 20))
+            {
+                bandwidth /= (1ULL << 10);
+                unit_str = "K";
+            }
+            else if (bandwidth < (1ULL << 30))
+            {
+                bandwidth /= (1ULL << 20);
+                unit_str = "M";
+            }
+            else if (bandwidth < (1ULL << 40))
+            {
+                bandwidth /= (1ULL << 30);
+                unit_str = "G";
+            }
+            else if (bandwidth < (1ULL << 50))
+            {
+                bandwidth /= (1ULL << 40);
+                unit_str = "T";
+            }
+
+            fprintf(stdout, "%d: %s%s%s%s%s%s  %8.03f %siB/s%s",
                     i,
                     (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
                      (ytc->ytc_io_pattern ==
@@ -1346,10 +1372,10 @@ yapio_exec_all_tests(void)
                     ytc->ytc_no_fsync        ? "f" : "-",
                     ytc->ytc_backwards       ? "b" : "-",
                     ytc->ytc_leave_holes     ? "h" : "-",
-                    YAPIO_TIMER_ARGS(&test_duration),
-                    yapioBarrierStats ? "" : "\n");
+                    bandwidth, unit_str,
+                    yapioDisplayStats ? "" : "\n");
 
-            if (yapioBarrierStats)
+            if (yapioDisplayStats)
             {
                 float barrier_results[YAPIO_BARRIER_STATS_LAST];
                 int   barrier_max_rank;
@@ -1357,12 +1383,14 @@ yapio_exec_all_tests(void)
                 yapio_gather_barrier_stats(&barrier_wait[0], barrier_results,
                                            &barrier_max_rank);
 
-                fprintf(stdout, " <%d:"YAPIO_TIME_PRINT_SPEC", "
-                        YAPIO_TIME_PRINT_SPEC", "YAPIO_TIME_PRINT_SPEC">\n",
-                        barrier_max_rank,
-                        barrier_results[YAPIO_BARRIER_STATS_MAX],
+                fprintf(stdout,
+                        "  %8.2f  <"YAPIO_TIME_PRINT_SPEC","
+                        YAPIO_TIME_PRINT_SPEC","YAPIO_TIME_PRINT_SPEC":%d>\n",
+                        YAPIO_TIMER_ARGS(&test_duration),
                         barrier_results[YAPIO_BARRIER_STATS_AVG],
-                        barrier_results[YAPIO_BARRIER_STATS_MED]);
+                        barrier_results[YAPIO_BARRIER_STATS_MED],
+                        barrier_results[YAPIO_BARRIER_STATS_MAX],
+                        barrier_max_rank);
             }
         }
 
