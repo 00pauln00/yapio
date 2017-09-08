@@ -748,7 +748,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         }
     }
 
-    if (!rc)
+    if (!rc && !ytc->ytc_no_fsync)
     {
         rc = fsync(yapioFileDesc);
         if (rc)
@@ -1343,9 +1343,9 @@ yapio_exec_all_tests(void)
                       YAPIO_IOP_RANDOM ? "R" : "S")),
                     ytc->ytc_read            ? "r" : "w",
                     ytc->ytc_remote_locality ? "D" : "L",
-                    ytc->ytc_backwards       ? "b" : " ",
-                    ytc->ytc_leave_holes     ? "h" : " ",
-                    ytc->ytc_no_fsync        ? "f" : " ",
+                    ytc->ytc_no_fsync        ? "f" : "-",
+                    ytc->ytc_backwards       ? "b" : "-",
+                    ytc->ytc_leave_holes     ? "h" : "-",
                     YAPIO_TIMER_ARGS(&test_duration),
                     yapioBarrierStats ? "" : "\n");
 
