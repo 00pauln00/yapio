@@ -885,19 +885,19 @@ yapio_setup_buffers(void)
 static void
 yapio_unlink_test_file(void)
 {
-    if (!yapioKeepFile && yapio_leader_rank())
+    if (yapioKeepFile || (!yapioFilePerProcess && !yapio_leader_rank()))
+        return;
+
+    int rc = unlink(yapioTestFileName);
+    if (rc)
     {
-        int rc = unlink(yapioTestFileName);
-        if (rc)
-        {
-            log_msg(YAPIO_LL_ERROR, "unlink %s: %s", yapioTestFileName,
-                    strerror(errno));
+        log_msg(YAPIO_LL_ERROR, "unlink %s: %s", yapioTestFileName,
+                strerror(errno));
 
-            yapio_exit(YAPIO_EXIT_ERR);
-        }
-
-        log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
+        yapio_exit(YAPIO_EXIT_ERR);
     }
+
+    log_msg(YAPIO_LL_DBG, "%s", yapioTestFileName);
 }
 
 static void
