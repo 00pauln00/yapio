@@ -101,8 +101,8 @@ yapio_blk_md_t  *yapioSourceBlkMd; //metadata which this rank maintains
 
 typedef struct yapio_test_context_md_handle
 {
-    yapio_blk_md_t    **ytcmh_ops;
-    int                *ytcmh_num_ops;
+    yapio_blk_md_t *ytcmh_ops;
+    int             ytcmh_num_ops;
 } yapio_test_ctx_md_t;
 
 typedef struct timespec yapio_timer_t;
@@ -726,19 +726,14 @@ yapio_get_rw_offset(const yapio_blk_md_t *md, size_t blk_sz)
 
 yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *ytc,
-                           enum yapio_test_ctx_mdh_in_out in_out,
-                           int rank_idx, int *num_ops)
+                           enum yapio_test_ctx_mdh_in_out in_out, int *num_ops)
 {
-    if (rank_idx >= yapioNumRanks)
-        log_msg(YAPIO_LL_FATAL, "rank_idx=%d exceeds yapioNumRanks=%d",
-                rank_idx, yapioNumRanks);
-
     const yapio_test_ctx_md_t *ytcmh = &ytc->ytc_in_out_md_ops[in_out];
 
     if (num_ops)
-        *num_ops = ytcmh->ytcmh_num_ops[rank_idx];
+        *num_ops = ytcmh->ytcmh_num_ops;
 
-    yapio_blk_md_t *md_array = ytcmh->ytcmh_ops[rank_idx];
+    yapio_blk_md_t *md_array = ytcmh->ytcmh_ops;
 
     return md_array;
 }
@@ -794,7 +789,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         int num_ops_in = 0;
 
         const yapio_blk_md_t *md_array =
-            yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN, rank_idx,
+            yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
                                        &num_ops_in);
         if (!md_array)
             continue;
@@ -897,7 +892,7 @@ yapio_unlink_test_file(void)
         yapio_exit(YAPIO_EXIT_ERR);
     }
 
-    log_msg(YAPIO_LL_DBG, "%s", yapioTestFileName);
+    log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
 }
 
 static void
@@ -905,19 +900,8 @@ yapio_test_ctx_release_md(yapio_test_ctx_md_t *ytcmh)
 {
     if (ytcmh->ytcmh_ops)
     {
-        int i;
-        for (i = 0; i < yapioNumRanks; i++)
-            if (ytcmh->ytcmh_ops[i])
-                free(ytcmh->ytcmh_ops[i]);
-
         free(ytcmh->ytcmh_ops);
         ytcmh->ytcmh_ops = NULL;
-    }
-
-    if (ytcmh->ytcmh_num_ops)
-    {
-        free(ytcmh->ytcmh_num_ops);
-        ytcmh->ytcmh_num_ops = NULL;
     }
 }
 
@@ -961,9 +945,8 @@ yapio_read_from_dev_urandom(void *buffer, size_t size)
 }
 
 static yapio_blk_md_t *
-yapio_test_context_alloc_rank(yapio_test_ctx_t *ytc,
-                              enum yapio_test_ctx_mdh_in_out in_out,
-                              int rank_idx, size_t nblks)
+yapio_test_context_alloc(yapio_test_ctx_t *ytc,
+                         enum yapio_test_ctx_mdh_in_out in_out, size_t nblks)
 {
     if (in_out >= YAPIO_TEST_CTX_MDH_MAX)
     {
@@ -973,24 +956,10 @@ yapio_test_context_alloc_rank(yapio_test_ctx_t *ytc,
 
     yapio_test_ctx_md_t *ytcmh = &ytc->ytc_in_out_md_ops[in_out];
 
-    if (!ytcmh->ytcmh_num_ops)
-    {
-        ytcmh->ytcmh_num_ops = calloc(yapioNumRanks, sizeof(int));
-        if (!ytcmh->ytcmh_num_ops)
-            return NULL;
-    }
+    ytcmh->ytcmh_num_ops = nblks;
+    ytcmh->ytcmh_ops = calloc(nblks, sizeof(yapio_blk_md_t));
 
-    if (!ytcmh->ytcmh_ops)
-    {
-        ytcmh->ytcmh_ops = calloc(yapioNumRanks, sizeof(yapio_blk_md_t *));
-        if (!ytcmh->ytcmh_ops)
-            return NULL;
-    }
-
-    ytcmh->ytcmh_num_ops[rank_idx] = nblks;
-    ytcmh->ytcmh_ops[rank_idx] = calloc(nblks, sizeof(yapio_blk_md_t));
-
-    return ytcmh->ytcmh_ops[rank_idx];
+    return ytcmh->ytcmh_ops;
 }
 
 static void
@@ -1005,7 +974,7 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc,
         YAPIO_TEST_CTX_MDH_OUT : YAPIO_TEST_CTX_MDH_IN;
 
     yapio_blk_md_t *md =
-        yapio_test_ctx_to_md_array(ytc, in_out, rank, &num_ops);
+        yapio_test_ctx_to_md_array(ytc, in_out, &num_ops);
 
     if (!md)
         log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank);
@@ -1091,9 +1060,8 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
      * Source Blk Metadata - there is no exchange with other ranks.
      */
     yapio_blk_md_t *md =
-        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN, yapioMyRank,
-                                      yapioNumBlksPerRank);
-
+        yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                 yapioNumBlksPerRank);
     if (!md)
         return -errno;
 
@@ -1131,11 +1099,11 @@ yapio_test_context_setup_distributed_sequential(yapio_test_ctx_t *ytc)
 //        return -errno;
 
     yapio_blk_md_t *md_send =
-        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
-                                      dest_rank, yapioNumBlksPerRank);
+        yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                 yapioNumBlksPerRank);
     yapio_blk_md_t *md_recv =
-        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN,
-                                      yapioMyRank, yapioNumBlksPerRank);
+        yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                 yapioNumBlksPerRank);
 
     yapio_test_context_sequential_setup_for_rank(ytc, dest_rank);
 
@@ -1167,15 +1135,14 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
         return -EINVAL;
 
     yapio_blk_md_t *md_recv =
-        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_IN,
-                                      yapioMyRank, yapioNumBlksPerRank);
+        yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                 yapioNumBlksPerRank);
     if (!md_recv)
         return -errno;
 
     yapio_blk_md_t *md_send =
-        yapio_test_context_alloc_rank(ytc, YAPIO_TEST_CTX_MDH_OUT,
-                                      yapioMyRank,
-                                      yapioNumBlksPerRank);
+        yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                 yapioNumBlksPerRank);
     if (!md_send)
         return -errno;
 
