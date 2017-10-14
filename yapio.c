@@ -128,6 +128,7 @@ typedef struct yapio_test_context
                              ytc_no_fsync:1,
                              ytc_test_complete:1;
     enum yapio_patterns      ytc_io_pattern;       //IO pattern to be employed
+    int                      ytc_test_num;
     yapio_timer_t            ytc_setup_time;
     yapio_timer_t            ytc_test_duration;
     yapio_timer_t            ytc_barrier_wait[2];
@@ -1531,8 +1532,10 @@ yapio_prepare_fpp_file_desc(const yapio_test_ctx_t *ytc)
  *   set of operations to be performed by this rank.
  */
 static int
-yapio_test_context_setup(yapio_test_ctx_t *ytc)
+yapio_test_context_setup(yapio_test_ctx_t *ytc, const int test_num)
 {
+    ytc->ytc_test_num = test_num;
+
     int rc = ytc->ytc_remote_locality ?
         yapio_test_context_setup_distributed(ytc) :
         yapio_test_context_setup_local(ytc);
@@ -1685,7 +1688,7 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
 }
 
 static void
-yapio_display_result(const yapio_test_ctx_t *ytc, int test_num)
+yapio_display_result(const yapio_test_ctx_t *ytc)
 {
     const yapio_timer_t *barrier_wait = ytc->ytc_barrier_wait;
     const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
@@ -1727,7 +1730,7 @@ yapio_display_result(const yapio_test_ctx_t *ytc, int test_num)
     }
 
     fprintf(stdout, "%d.%d: %s%s%s%s%s%s  %8.03f %siB/s%s",
-            ytc->ytc_group->ytg_group_num, test_num,
+            ytc->ytc_group->ytg_group_num, ytc->ytc_test_num,
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern ==
               YAPIO_IOP_RANDOM ? "R" : "S")),
@@ -1783,7 +1786,7 @@ yapio_exec_all_tests(void)
         if (yapio_leader_rank())
             yapio_start_timer(&ytc->ytc_setup_time);
 
-        int rc = yapio_test_context_setup(ytc);
+        int rc = yapio_test_context_setup(ytc, i);
         if (rc)
             yapio_exit(rc);
 
@@ -1813,7 +1816,7 @@ yapio_exec_all_tests(void)
 
         ytc->ytc_test_complete = 1;
 
-        yapio_display_result(ytc, i);
+        yapio_display_result(ytc);
 
         /* Free memory allocated in the test.
          */
