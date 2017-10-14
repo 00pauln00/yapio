@@ -1685,10 +1685,11 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
 }
 
 static void
-yapio_display_result(const yapio_test_ctx_t *ytc,
-                     const yapio_timer_t *barrier_wait,
-                     const yapio_timer_t *test_duration, int test_num)
+yapio_display_result(const yapio_test_ctx_t *ytc, int test_num)
 {
+    const yapio_timer_t *barrier_wait = ytc->ytc_barrier_wait;
+    const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
+
     if (!yapio_leader_rank())
     {
         if (yapioDisplayStats)
@@ -1812,8 +1813,7 @@ yapio_exec_all_tests(void)
 
         ytc->ytc_test_complete = 1;
 
-        yapio_display_result(ytc, ytc->ytc_barrier_wait,
-                             &ytc->ytc_test_duration, i);
+        yapio_display_result(ytc, i);
 
         /* Free memory allocated in the test.
          */
