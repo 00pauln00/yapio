@@ -882,7 +882,9 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         if (rc)
             log_msg(YAPIO_LL_FATAL, "yapio_open_fpp_file: %s", strerror(-rc));
 
-        yapio_make_fpp_filename(yapioTestFileNameFpp, yapioMyRank);
+        yapio_make_fpp_filename(yapioTestFileNameFpp,
+                                yapio_relative_rank_get(ytg, 0));
+
         log_msg(YAPIO_LL_DEBUG, "yapioTestFileNameFpp=%s",
                 yapioTestFileNameFpp);
     }
@@ -1191,19 +1193,19 @@ yapio_unlink_test_file(void)
 {
     bool fpp = yapioMyTestGroup->ytg_file_per_process;
 
+    const char *unlink_fn = fpp ? yapioTestFileNameFpp : yapioTestFileName;
+    log_msg(YAPIO_LL_DEBUG, "%s keep=%d", unlink_fn, yapioKeepFile);
+
     if (yapioKeepFile || (!fpp && !yapio_leader_rank()))
         return;
 
-    int rc = unlink(fpp ? yapioTestFileNameFpp : yapioTestFileName);
+    int rc = unlink(unlink_fn);
     if (rc)
     {
-        log_msg(YAPIO_LL_ERROR, "unlink %s: %s", yapioTestFileName,
-                strerror(errno));
+        log_msg(YAPIO_LL_ERROR, "unlink %s: %s", unlink_fn, strerror(errno));
 
         yapio_exit(YAPIO_EXIT_ERR);
     }
-
-    log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
 }
 
 static void
