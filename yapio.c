@@ -82,7 +82,7 @@ static pthread_t       yapioStatsReportingThread;
 static pthread_cond_t  yapioThreadCond  = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t yapioThreadMutex = PTHREAD_MUTEX_INITIALIZER;
 
-#define YAPIO_STATS_SLEEP_USEC 100000
+#define YAPIO_STATS_SLEEP_USEC 10000
 
 #define MPI_OP_START pthread_mutex_lock(&yapioThreadMutex)
 #define MPI_OP_END   pthread_mutex_unlock(&yapioThreadMutex)
@@ -166,6 +166,7 @@ typedef struct yapio_test_context
     enum yapio_test_ctx_run  ytc_run_status;
     yapio_timer_t            ytc_setup_time;
     yapio_timer_t            ytc_test_duration;
+    yapio_timer_t            ytc_reported_time;
     yapio_timer_t            ytc_barrier_wait[2];
     yapio_test_ctx_md_t      ytc_in_out_md_ops[YAPIO_TEST_CTX_MDH_MAX];
     float                    ytc_barrier_results[YAPIO_BARRIER_STATS_LAST];
@@ -1810,7 +1811,8 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
         unit_str = "T";
     }
 
-    fprintf(stdout, "%d.%d: %s%s%s%s%s%s  %8.03f %siB/s%s",
+    fprintf(stdout, "%8.2f %02d.%02d: %s%s%s%s%s%s %6.02f %siB/s%s",
+            yapio_timer_to_float(&ytc->ytc_reported_time),
             ytc->ytc_group->ytg_group_num, ytc->ytc_test_num,
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern ==
@@ -1936,6 +1938,9 @@ yapio_stats_reporting(void *unused_arg)
 {
     int remaining_test_contexts_to_report;
 
+    yapio_timer_t start_time;
+    yapio_get_time(&start_time);
+
     do
     {
         remaining_test_contexts_to_report = 0;
@@ -1945,17 +1950,21 @@ yapio_stats_reporting(void *unused_arg)
         int i;
         for (i = 0; i < yapioNumTestGroups; i++)
         {
-            const yapio_test_group_t *ytg = &yapioTestGroups[i];
+            yapio_test_group_t *ytg = &yapioTestGroups[i];
             int j;
             for (j = 0; j < ytg->ytg_num_contexts; j++)
             {
-                const yapio_test_ctx_t *ytc = &ytg->ytg_contexts[j];
+                yapio_test_ctx_t *ytc = &ytg->ytg_contexts[j];
 
                 if (ytc->ytc_run_status == YAPIO_TEST_CTX_RUN_COMPLETE)
                 {
-                    yapio_display_result(ytc);
-                    ((yapio_test_ctx_t *)ytc)->ytc_run_status =
+                    ytc->ytc_reported_time = start_time;
+                    yapio_end_timer(&ytc->ytc_reported_time);
+
+                    ytc->ytc_run_status =
                         YAPIO_TEST_CTX_RUN_STATS_REPORTED;
+
+                    yapio_display_result(ytc);
                 }
 
                 if (ytc->ytc_run_status != YAPIO_TEST_CTX_RUN_STATS_REPORTED)
