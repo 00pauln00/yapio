@@ -76,9 +76,28 @@ static int         yapioNumRanks;
 static int         yapioFileDesc;
 static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
-#if 0
-static pthread_t   yapioStatsThread;
-#endif
+
+static pthread_t       yapioStatsCollectionThread;
+static pthread_t       yapioStatsReportingThread;
+static pthread_cond_t  yapioThreadCond  = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t yapioThreadMutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define YAPIO_STATS_SLEEP_USEC 100000
+
+#define MPI_OP_START pthread_mutex_lock(&yapioThreadMutex)
+#define MPI_OP_END   pthread_mutex_unlock(&yapioThreadMutex)
+
+static int
+yapio_mpi_barrier(MPI_Comm comm)
+{
+    int rc;
+
+    MPI_OP_START;
+    rc = MPI_Barrier(comm);
+    MPI_OP_END;
+
+    return rc;
+}
 
 /* Set of magic numbers which will be used for block tagging.
  */
@@ -117,6 +136,22 @@ enum yapio_test_ctx_mdh_in_out
     YAPIO_TEST_CTX_MDH_MAX = 2,
 };
 
+enum yapio_test_ctx_run
+{
+    YAPIO_TEST_CTX_RUN_NOT_STARTED,
+    YAPIO_TEST_CTX_RUN_STARTED,
+    YAPIO_TEST_CTX_RUN_COMPLETE,
+    YAPIO_TEST_CTX_RUN_STATS_REPORTED,
+};
+
+enum yapio_barrier_stats
+{
+    YAPIO_BARRIER_STATS_AVG  = 0,
+    YAPIO_BARRIER_STATS_MAX  = 1,
+    YAPIO_BARRIER_STATS_MED  = 2,
+    YAPIO_BARRIER_STATS_LAST = 3
+};
+
 struct yapio_test_group;
 
 typedef struct yapio_test_context
@@ -125,14 +160,16 @@ typedef struct yapio_test_context
                              ytc_backwards:1,
                              ytc_remote_locality:1,
                              ytc_read:1,
-                             ytc_no_fsync:1,
-                             ytc_test_complete:1;
+                             ytc_no_fsync:1;
     enum yapio_patterns      ytc_io_pattern;       //IO pattern to be employed
     int                      ytc_test_num;
+    enum yapio_test_ctx_run  ytc_run_status;
     yapio_timer_t            ytc_setup_time;
     yapio_timer_t            ytc_test_duration;
     yapio_timer_t            ytc_barrier_wait[2];
     yapio_test_ctx_md_t      ytc_in_out_md_ops[YAPIO_TEST_CTX_MDH_MAX];
+    float                    ytc_barrier_results[YAPIO_BARRIER_STATS_LAST];
+    int                      ytc_barrier_max_rank;
     struct yapio_test_group *ytc_group;
 } yapio_test_ctx_t;
 
@@ -220,7 +257,7 @@ yapio_exit(int exit_rc)
 {
     if (yapioMpiInit)
     {
-        MPI_Barrier(MPI_COMM_WORLD);
+        yapio_mpi_barrier(MPI_COMM_WORLD);
         MPI_Finalize();
     }
 
@@ -821,9 +858,11 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
     /* Broadcast only the section of the filename which was modified by
      * mkstemp().
      */
+    MPI_OP_START;
     MPI_Bcast(&yapioTestFileName[path_len - YAPIO_MKSTEMP_TEMPLATE_LEN],
               YAPIO_MKSTEMP_TEMPLATE_LEN, MPI_CHAR, 0,
               yapioMyTestGroup->ytg_comm);
+    MPI_OP_END;
 
     if (ytg->ytg_file_per_process)
     {
@@ -1383,10 +1422,12 @@ yapio_test_context_setup_distributed_sequential(yapio_test_ctx_t *ytc)
 
     log_msg(YAPIO_LL_TRACE, "dest_rank=%d recv_rank=%d", dest_rank, recv_rank);
 
+    MPI_OP_START;
     int rc = MPI_Sendrecv((void *)md_send, send_recv_cnt, MPI_BYTE, dest_rank,
                           send_recv_tag, (void *)md_recv, send_recv_cnt,
                           MPI_BYTE, recv_rank, send_recv_tag,
                           yapioMyTestGroup->ytg_comm, &status);
+    MPI_OP_END;
 
     if (rc != MPI_SUCCESS)
         log_msg(YAPIO_LL_ERROR, "MPI_Sendrecv: %d", rc);
@@ -1464,9 +1505,12 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
 
     int send_recv_cnt = nblks_div_nranks * sizeof(yapio_blk_md_t);
 
+    MPI_OP_START;
     int rc = MPI_Alltoall(md_send, send_recv_cnt, MPI_BYTE,
                           md_recv, send_recv_cnt, MPI_BYTE,
                           yapioMyTestGroup->ytg_comm);
+    MPI_OP_END;
+
     if (rc != MPI_SUCCESS)
     {
         log_msg(YAPIO_LL_ERROR, "MPI_Alltoall: %d", rc);
@@ -1535,6 +1579,7 @@ static int
 yapio_test_context_setup(yapio_test_ctx_t *ytc, const int test_num)
 {
     ytc->ytc_test_num = test_num;
+    ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_NOT_STARTED;
 
     int rc = ytc->ytc_remote_locality ?
         yapio_test_context_setup_distributed(ytc) :
@@ -1597,14 +1642,6 @@ yapio_verify_test_contexts(yapio_test_group_t *ytg)
     }
 }
 
-enum yapio_barrier_stats
-{
-    YAPIO_BARRIER_STATS_AVG  = 0,
-    YAPIO_BARRIER_STATS_MAX  = 1,
-    YAPIO_BARRIER_STATS_MED = 2,
-    YAPIO_BARRIER_STATS_LAST = 3
-};
-
 static float
 yapio_timer_to_float(const yapio_timer_t *timer)
 {
@@ -1649,9 +1686,11 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
             log_msg(YAPIO_LL_FATAL, "calloc: %s", strerror(ENOMEM));
     }
 
+    MPI_OP_START;
     int rc = MPI_Gather(barrier_timer_this_rank, sizeof(yapio_timer_t),
                         MPI_BYTE, all_barrier_timers, sizeof(yapio_timer_t),
                         MPI_BYTE, 0, yapioMyTestGroup->ytg_comm);
+    MPI_OP_END;
 
     if (rc != MPI_SUCCESS)
         log_msg(YAPIO_LL_FATAL, "MPI_Gather: error=%d", rc);
@@ -1688,23 +1727,63 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
 }
 
 static void
-yapio_display_result(const yapio_test_ctx_t *ytc)
+yapio_gather_test_barrier_results(yapio_test_ctx_t *ytc)
 {
-    const yapio_timer_t *barrier_wait = ytc->ytc_barrier_wait;
-    const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
-
-    if (!yapio_leader_rank())
+    if (yapioDisplayStats)
     {
-        if (yapioDisplayStats)
-            return yapio_gather_barrier_stats(barrier_wait, NULL, NULL);
+        yapio_leader_rank() ?
+            yapio_gather_barrier_stats(ytc->ytc_barrier_wait,
+                                       ytc->ytc_barrier_results,
+                                       &ytc->ytc_barrier_max_rank) :
+            yapio_gather_barrier_stats(ytc->ytc_barrier_wait, NULL, NULL);
+    }
+}
 
+static void
+yapio_stat_ready(void)
+{
+    pthread_mutex_lock(&yapioThreadMutex);
+    pthread_cond_signal(&yapioThreadCond);
+    pthread_mutex_unlock(&yapioThreadMutex);
+}
+
+static void
+yapio_send_test_results(yapio_test_ctx_t *ytc)
+{
+    if (!yapio_leader_rank())
         return;
+
+    if (ytc->ytc_group->ytg_group_num > 0)
+    {
+        //XXx sending the whole ctx is not a good idea
+        MPI_OP_START;
+        int rc = MPI_Send(ytc, sizeof(yapio_test_ctx_t), MPI_BYTE, 0,
+                          ytc->ytc_test_num, MPI_COMM_WORLD);
+        MPI_OP_END;
+
+        if (rc != MPI_SUCCESS)
+            log_msg(YAPIO_LL_FATAL, "MPI_Send failed: %d", rc);
+    }
+    else
+    {
+        /* Local operation to wake up stats reporting thread.
+         */
+        yapio_stat_ready();
     }
 
-    /* Work done by leader rank.
-     */
+    log_msg(YAPIO_LL_DEBUG, "ytc_test_num=%d", ytc->ytc_test_num);
+}
+
+static void
+yapio_display_result(const yapio_test_ctx_t *ytc)
+{
+    const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
+    const int nranks = ytc->ytc_group->ytg_num_ranks;
+    const size_t nblks_per_rank = ytc->ytc_group->ytg_num_blks_per_rank;
+    const size_t blksz = ytc->ytc_group->ytg_blk_sz;
+
     float bandwidth =
-        (float)(((float)yapioNumRanks * yapioNumBlksPerRank * yapioBlkSz) /
+        (float)(((float)nranks * nblks_per_rank * blksz) /
                 yapio_timer_to_float(test_duration));
 
     char *unit_str;
@@ -1744,11 +1823,8 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
 
     if (yapioDisplayStats)
     {
-        float barrier_results[YAPIO_BARRIER_STATS_LAST];
-        int   barrier_max_rank;
-
-        yapio_gather_barrier_stats(barrier_wait, barrier_results,
-                                   &barrier_max_rank);
+        const float *barrier_results = ytc->ytc_barrier_results;
+        int   barrier_max_rank = ytc->ytc_barrier_max_rank;
 
         fprintf(stdout,
                 "  %8.2f <"YAPIO_TIME_PRINT_SPEC","YAPIO_TIME_PRINT_SPEC","
@@ -1767,7 +1843,7 @@ yapio_exec_all_tests(void)
 {
     yapio_test_group_t *ytg = yapioMyTestGroup;
 
-    MPI_Barrier(yapioMyTestGroup->ytg_comm);
+    yapio_mpi_barrier(yapioMyTestGroup->ytg_comm);
 
     log_msg_r0(YAPIO_LL_DEBUG,
                "g@%p nctxs=%d nranks=%d nblks=%zu blksz=%zu fpp=%d lr=%d",
@@ -1790,21 +1866,23 @@ yapio_exec_all_tests(void)
         if (rc)
             yapio_exit(rc);
 
-        MPI_Barrier(yapioMyTestGroup->ytg_comm); //setup barrier
+        yapio_mpi_barrier(yapioMyTestGroup->ytg_comm); //setup barrier
 
         if (yapio_leader_rank())
             yapio_end_timer(&ytc->ytc_setup_time);
 
+        ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_STARTED;
+
         /* Sync all ranks before and after starting the test.
          */
-        MPI_Barrier(yapioMyTestGroup->ytg_comm);
+        yapio_mpi_barrier(yapioMyTestGroup->ytg_comm);
         if (yapio_leader_rank())
             yapio_start_timer(&ytc->ytc_test_duration);
 
         yapio_perform_io(ytc);
 
         yapio_start_timer(&ytc->ytc_barrier_wait[0]);
-        MPI_Barrier(yapioMyTestGroup->ytg_comm);
+        yapio_mpi_barrier(yapioMyTestGroup->ytg_comm);
         yapio_start_timer(&ytc->ytc_barrier_wait[1]);
 
         /* Result is in barrier[0]
@@ -1814,9 +1892,10 @@ yapio_exec_all_tests(void)
         yapio_get_time_duration(&ytc->ytc_test_duration,
                                 &ytc->ytc_barrier_wait[1]);
 
-        ytc->ytc_test_complete = 1;
+        ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_COMPLETE;
 
-        yapio_display_result(ytc);
+        yapio_gather_test_barrier_results(ytc);
+        yapio_send_test_results(ytc);
 
         /* Free memory allocated in the test.
          */
@@ -1850,70 +1929,138 @@ yapio_assign_rank_to_group(void)
                 yapioMyRank);
 }
 
-#if 0
 static void *
-yapio_stats_collection(void *unused_arg)
+yapio_stats_reporting(void *unused_arg)
 {
-    yapio_test_group_t ytg_for_stats[YAPIO_NUM_TEST_CTXS_MAX];
-
-    memcpy(ytg_for_stats, yapioTestGroups,
-           YAPIO_NUM_TEST_CTXS_MAX * sizeof(yapio_test_group_t));
-
-    ssize_t num_global_test_contexts;
-    int i;
-    /* Skip the first group since the leader rank is 'this' rank.
-     */
-    for (i = 0, num_global_test_contexts = 0; i < yapioNumTestGroups; i++)
-        num_global_test_contexts += ytg_for_stats[i].ytg_num_contexts;
-
-    if (!num_global_test_contexts)
-        return NULL;
-
-    MPI_Request *requests =
-        calloc(num_global_test_contexts, sizeof(MPI_Request));
-
-    if (!requests)
-        log_msg(YAPIO_LL_FATAL, "calloc: %s", strerror(errno));
-
-    for (i = 1; i < yapioNumTestGroups; i++)
-    {
-        int j;
-        for (j = 0; j < ytg_for_stats[i].ytg_num_contexts; j++)
-        {
-            int rc = MPI_Irecv(&ytg_for_stats[i].ytg_contexts[j],
-                               sizeof(yapio_test_ctx_t), MPI_BYTE,
-                               ytg_for_stats[i].ytg_first_rank, 0,
-                               MPI_COMM_WORLD, &requests[i + j]);
-
-            if (rc != MPI_SUCCESS)
-                return NULL;
-        }
-    }
+    int remaining_test_contexts_to_report;
 
     do
     {
-        usleep(10000);
+        remaining_test_contexts_to_report = 0;
 
-        int j;
-        for (i = 0, j = 0; j < yapioNumTestGroups; j++)
+        pthread_mutex_lock(&yapioThreadMutex);
+
+        int i;
+        for (i = 0; i < yapioNumTestGroups; i++)
         {
-            yapio_test_group_t *ytg =
-                j ? &ytg_for_stats[j] : &yapioTestGroups[0];
+            const yapio_test_group_t *ytg = &yapioTestGroups[i];
+            int j;
+            for (j = 0; j < ytg->ytg_num_contexts; j++)
+            {
+                const yapio_test_ctx_t *ytc = &ytg->ytg_contexts[j];
 
+                if (ytc->ytc_run_status == YAPIO_TEST_CTX_RUN_COMPLETE)
+                {
+                    yapio_display_result(ytc);
+                    ((yapio_test_ctx_t *)ytc)->ytc_run_status =
+                        YAPIO_TEST_CTX_RUN_STATS_REPORTED;
+                }
 
+                if (ytc->ytc_run_status != YAPIO_TEST_CTX_RUN_STATS_REPORTED)
+                    remaining_test_contexts_to_report++;
+            }
         }
-    } while (i < num_global_test_contexts);
+
+        if (remaining_test_contexts_to_report)
+            pthread_cond_wait(&yapioThreadCond, &yapioThreadMutex);
+
+        pthread_mutex_unlock(&yapioThreadMutex);
+    } while (remaining_test_contexts_to_report);
+
+    return unused_arg;
+}
+
+static void *
+yapio_stats_collection(void *unused_arg)
+{
+    ssize_t num_remote_test_contexts;
+    int i;
+    /* Skip the first group since the leader rank is 'this' rank.
+     */
+    for (i = 1, num_remote_test_contexts = 0; i < yapioNumTestGroups; i++)
+        num_remote_test_contexts += yapioTestGroups[i].ytg_num_contexts;
+
+    if (!num_remote_test_contexts)
+        return NULL;
+
+    log_msg(YAPIO_LL_DEBUG, "num_remote_test_contexts=%zd",
+            num_remote_test_contexts);
+
+    MPI_Request requests[num_remote_test_contexts];
+
+    int req_num;
+    for (i = 1, req_num = 0; i < yapioNumTestGroups; i++)
+    {
+        yapio_test_group_t *ytg = &yapioTestGroups[i];
+        int j;
+        for (j = 0; j < ytg->ytg_num_contexts; j++)
+        {
+            MPI_OP_START;
+            int rc = MPI_Irecv(&ytg->ytg_contexts[j], sizeof(yapio_test_ctx_t),
+                               MPI_BYTE, ytg->ytg_first_rank, j,
+                               MPI_COMM_WORLD, &requests[req_num++]);
+            MPI_OP_END;
+
+            if (rc != MPI_SUCCESS)
+                log_msg(YAPIO_LL_FATAL, "MPI_Irecv failed: %d", rc);
+        }
+    }
+
+    int remaining_reports = num_remote_test_contexts;
+    while (remaining_reports)
+    {
+        int index, flag;
+        MPI_Status status;
+
+        MPI_OP_START;
+        int rc = MPI_Testany(num_remote_test_contexts, requests, &index, &flag,
+                             &status);
+        MPI_OP_END;
+
+        if (rc != MPI_SUCCESS)
+            log_msg(YAPIO_LL_FATAL, "MPI_Testany failed: %d", rc);
+
+        if (index != MPI_UNDEFINED)
+        {
+            remaining_reports--;
+
+            log_msg(YAPIO_LL_DEBUG, "index=%d rc=%d flag=%d rem=%d",
+                    i, rc, flag, remaining_reports);
+
+            yapio_stat_ready();
+        }
+
+        usleep(YAPIO_STATS_SLEEP_USEC);
+    }
 
     return unused_arg;
 }
 
 static void
-yapio_start_stats_collection_thread(void)
+yapio_start_stats_collection_and_reporting_threads(void)
 {
-    if (pthread_create(&yapioStatsThread, NULL, yapio_stats_collection, NULL))
+    if (pthread_create(&yapioStatsReportingThread, NULL,
+                       yapio_stats_reporting, NULL))
         log_msg(YAPIO_LL_FATAL, "pthread_create: %s", strerror(errno));
+
+    if (yapioNumTestGroups > 1)
+    {
+        /* This thread only starts if there are multiple test groups.
+         */
+        if (pthread_create(&yapioStatsCollectionThread, NULL,
+                           yapio_stats_collection, NULL))
+            log_msg(YAPIO_LL_FATAL, "pthread_create: %s", strerror(errno));
+    }
 }
-#endif
+
+static void
+yapio_destroy_collection_and_reporting_threads(void)
+{
+    pthread_join(yapioStatsReportingThread, NULL);
+
+    if (yapioNumTestGroups > 1)
+        pthread_join(yapioStatsCollectionThread, NULL);
+}
 
 int
 main(int argc, char *argv[])
@@ -1930,16 +2077,17 @@ main(int argc, char *argv[])
 
     yapio_setup_test_file(yapioMyTestGroup);
 
-#if 0
     if (yapio_global_leader_rank())
-        yapio_start_stats_collection_thread();
-#endif
+        yapio_start_stats_collection_and_reporting_threads();
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    yapio_mpi_barrier(MPI_COMM_WORLD);
 
     yapio_exec_all_tests();
 
     yapio_close_test_file(yapioMyTestGroup);
+
+    if (yapio_global_leader_rank())
+        yapio_destroy_collection_and_reporting_threads();
 
     yapio_destroy_buffers();
 
