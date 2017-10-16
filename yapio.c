@@ -1346,6 +1346,8 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
                 md_out[i].ybm_blk_number);
     }
 
+    free(array_of_randoms);
+
     return 0;
 }
 
