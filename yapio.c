@@ -878,10 +878,15 @@ yapio_verify_test_directory(void)
 }
 
 static int
-yapio_make_fpp_filename(char *file_name, int rank)
+yapio_make_filename(char *file_name, int rank)
 {
-    if (snprintf(file_name, PATH_MAX, "%s%s.%d",
-                 yapioTestFileNamePrefix, yapioTestFileName, rank) > PATH_MAX)
+    int rc = rank >= 0 ?
+        snprintf(file_name, PATH_MAX, "%s%s.%d",
+                 yapioTestFileNamePrefix, yapioTestFileName, rank) :
+        snprintf(file_name, PATH_MAX, "%s%s",
+                 yapioTestFileNamePrefix, yapioTestFileName);
+
+    if (rc > PATH_MAX)
     {
         log_msg(YAPIO_LL_ERROR, "%s", strerror(ENAMETOOLONG));
         return -ENAMETOOLONG;
@@ -898,7 +903,7 @@ yapio_open_fpp_file(int rank, int oflags)
 
     char file_per_process_name[PATH_MAX + 1];
 
-    int rc = yapio_make_fpp_filename(file_per_process_name, rank);
+    int rc = yapio_make_filename(file_per_process_name, rank);
     if (rc)
         return rc;
 
@@ -943,6 +948,8 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         if (yapioFileDesc < 0)
             log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
 
+        /* File will be reopened below by all ranks.
+         */
         close(yapioFileDesc);
 
         log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
@@ -977,14 +984,22 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         if (rc)
             log_msg(YAPIO_LL_FATAL, "yapio_open_fpp_file: %s", strerror(-rc));
 
-        yapio_make_fpp_filename(yapioTestFileNameFpp,
-                                yapio_relative_rank_get(ytg, 0));
+        yapio_make_filename(yapioTestFileNameFpp,
+                            yapio_relative_rank_get(ytg, 0));
 
         log_msg(YAPIO_LL_DEBUG, "yapioTestFileNameFpp=%s",
                 yapioTestFileNameFpp);
     }
     else
     {
+        /* Re-make the filename so that mode specific prefixes may be applied.
+         */
+        char tmp_filename[PATH_MAX + 1];
+
+        yapio_make_filename(tmp_filename, -1);
+
+        strncpy(yapioTestFileName, tmp_filename, PATH_MAX + 1);
+
         yapioFileDesc = YAPIO_SYS_CALL(open)(yapioTestFileName, O_RDWR, 0644);
         if (yapioFileDesc < 0)
             log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
