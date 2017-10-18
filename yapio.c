@@ -21,11 +21,14 @@
 #include <limits.h>
 #include <time.h>
 #include <pthread.h>
+#ifdef YAPIO_IME
+#include <im_client_native2.h>
+#endif
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:p:kt:PD:sF"
+#define YAPIO_OPTS "b:n:hd:m:p:kt:PD:sF"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -76,6 +79,8 @@ static int         yapioNumRanks;
 static int         yapioFileDesc;
 static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
+static bool        yapioVerifyRead = true;
+static const char *yapioTestFileNamePrefix = "";
 
 static pthread_t       yapioStatsCollectionThread;
 static pthread_t       yapioStatsReportingThread;
@@ -86,6 +91,57 @@ static pthread_mutex_t yapioThreadMutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define MPI_OP_START pthread_mutex_lock(&yapioThreadMutex)
 #define MPI_OP_END   pthread_mutex_unlock(&yapioThreadMutex)
+
+enum yapio_io_modes
+{
+    YAPIO_IO_MODE_DEFAULT = 0,
+    YAPIO_IO_MODE_POSIX   = YAPIO_IO_MODE_DEFAULT,
+    YAPIO_IO_MODE_IME     = 1,
+    YAPIO_IO_MODE_MPIIO   = 2, // Not yet supported
+    YAPIO_IO_MODE_LAST    = 3
+};
+
+typedef int     (*openf)(const char *, int, mode_t);
+typedef int     (*closef)(int);
+typedef int     (*fsyncf)(int);
+typedef int     (*unlinkf)(const char *);
+typedef ssize_t (*preadf)(int, void *, size_t, off_t);
+typedef ssize_t (*pwritef)(int, const void *, size_t, off_t);
+
+typedef struct yapio_io_syscall_ops
+{
+    openf   yapio_sys_open;
+    closef  yapio_sys_close;
+    fsyncf  yapio_sys_fsync;
+    unlinkf yapio_sys_unlink;
+    preadf  yapio_sys_pread;
+    pwritef yapio_sys_pwrite;
+} yapio_io_syscall_ops_t;
+
+static const yapio_io_syscall_ops_t *yapio_io_modes[YAPIO_IO_MODE_LAST];
+
+static const yapio_io_syscall_ops_t yapioDefaultSysCallOps =
+    {.yapio_sys_open   = (openf)open,
+     .yapio_sys_close  = close,
+     .yapio_sys_fsync  = fsync,
+     .yapio_sys_unlink = unlink,
+     .yapio_sys_pread  = pread,
+     .yapio_sys_pwrite = pwrite};
+
+const yapio_io_syscall_ops_t *yapioSysCallOps = &yapioDefaultSysCallOps;
+
+#ifdef YAPIO_IME
+const yapio_io_syscall_ops_t yapioIMESysCallOps =
+    {.yapio_sys_open   = ime_client_native2_open,
+     .yapio_sys_close  = ime_client_native2_close,
+     .yapio_sys_fsync  = ime_client_native2_fsync,
+     .yapio_sys_unlink = ime_client_native2_unlink,
+     .yapio_sys_pread  = (preadf)ime_client_native2_pread,
+     .yapio_sys_pwrite = (pwritef)ime_client_native2_pwrite};
+#endif
+
+#define YAPIO_SYS_CALL(__sys_call)              \
+    yapioSysCallOps->yapio_sys_ ## __sys_call
 
 static int
 yapio_mpi_barrier(MPI_Comm comm)
@@ -270,7 +326,7 @@ yapio_exit(int exit_rc)
 #define YAPIO_NSEC_PER_SEC 1000000000L
 #define YAPIO_USEC_PER_SEC 1000000L
 
-#define YAPIO_TIME_PRINT_SPEC "%.4f"
+#define YAPIO_TIME_PRINT_SPEC "%.3f"
 #define YAPIO_TIMER_ARGS(timer)                                         \
     (float)((timer)->tv_sec +                                           \
             (float)((float)(timer)->tv_nsec / YAPIO_NSEC_PER_SEC))
@@ -333,6 +389,7 @@ yapio_print_help(int exit_val)
                 "\t-F  File per process\n"
                 "\t-h  Print help message\n"
                 "\t-k  Keep file after test completion\n"
+                "\t-m  I/O Mode - default 'P' (posix), 'I' (IME native)\n"
                 "\t-n  Number of blocks per task\n"
                 "\t-p  File name prefix\n"
                 "\t-s  Display test duration and barrier wait times\n"
@@ -681,6 +738,31 @@ yapio_test_groups_setup_nranks(void)
     return 0;
 }
 
+static const yapio_io_syscall_ops_t *
+yapio_parse_io_mode(const char *io_mode_str)
+{
+    if (strnlen(io_mode_str, 2) > 1)
+        return NULL;
+
+    switch (io_mode_str[0])
+    {
+    case 'P':
+        return yapio_io_modes[YAPIO_IO_MODE_DEFAULT];
+
+    case 'I':
+        yapioTestFileNamePrefix = "ime://";
+        return yapio_io_modes[YAPIO_IO_MODE_IME];
+
+    case 'M':
+        yapioTestFileNamePrefix = "XXX://";
+        return yapio_io_modes[YAPIO_IO_MODE_MPIIO];
+    default:
+        return NULL;
+    }
+
+    return NULL;
+}
+
 static void
 yapio_getopts(int argc, char **argv)
 {
@@ -709,6 +791,9 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'k':
             yapioKeepFile = true;
+            break;
+        case 'm':
+            yapioSysCallOps = yapio_parse_io_mode(optarg);
             break;
         case 'n':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
@@ -795,8 +880,8 @@ yapio_verify_test_directory(void)
 static int
 yapio_make_fpp_filename(char *file_name, int rank)
 {
-    if (snprintf(file_name, PATH_MAX, "%s.%d",
-                 yapioTestFileName, rank) > PATH_MAX)
+    if (snprintf(file_name, PATH_MAX, "%s%s.%d",
+                 yapioTestFileNamePrefix, yapioTestFileName, rank) > PATH_MAX)
     {
         log_msg(YAPIO_LL_ERROR, "%s", strerror(ENAMETOOLONG));
         return -ENAMETOOLONG;
@@ -819,7 +904,8 @@ yapio_open_fpp_file(int rank, int oflags)
 
     if (yapioFileDescFpp[rank] < 0)
     {
-        yapioFileDescFpp[rank] = open(file_per_process_name, oflags, 0644);
+        yapioFileDescFpp[rank] =
+            YAPIO_SYS_CALL(open)(file_per_process_name, oflags, 0644);
 
         if (yapioFileDescFpp[rank] < 0)
         {
@@ -857,6 +943,8 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         if (yapioFileDesc < 0)
             log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
 
+        close(yapioFileDesc);
+
         log_msg(YAPIO_LL_DEBUG, "%s", yapioTestFileName);
     }
 
@@ -871,6 +959,8 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
 
     if (ytg->ytg_file_per_process)
     {
+        /* Remove the mkstemp file.
+         */
         if (yapio_leader_rank())
             unlink(yapioTestFileName);
 
@@ -895,12 +985,9 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
     }
     else
     {
-        if (!yapio_leader_rank())
-        {
-            yapioFileDesc = open(yapioTestFileName, O_RDWR);
-            if (yapioFileDesc < 0)
-                log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
-        }
+        yapioFileDesc = YAPIO_SYS_CALL(open)(yapioTestFileName, O_RDWR, 0644);
+        if (yapioFileDesc < 0)
+            log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
     }
 }
 
@@ -923,7 +1010,7 @@ yapio_close_test_file(const yapio_test_group_t *ytg)
         {
             if (yapioFileDescFpp[i] >= 0)
             {
-                rc = close(yapioFileDescFpp[i]);
+                rc = YAPIO_SYS_CALL(close)(yapioFileDescFpp[i]);
                 if (rc < 0)
                     break;
             }
@@ -931,7 +1018,7 @@ yapio_close_test_file(const yapio_test_group_t *ytg)
     }
     else
     {
-        rc = close(yapioFileDesc);
+        rc = YAPIO_SYS_CALL(close)(yapioFileDesc);
     }
 
     if (rc < 0)
@@ -1082,7 +1169,7 @@ yapio_fsync(void)
             if (yapioFileDescFpp[i] < 0)
                 continue;
 
-            if (fsync(yapioFileDescFpp[i]))
+            if (YAPIO_SYS_CALL(fsync)(yapioFileDescFpp[i]))
             {
                 rc = errno;
                 break;
@@ -1091,7 +1178,7 @@ yapio_fsync(void)
     }
     else
     {
-        if (fsync(yapioFileDesc))
+        if (YAPIO_SYS_CALL(fsync)(yapioFileDesc))
             rc = errno;
     }
 
@@ -1146,8 +1233,10 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
             int fd = yapio_get_fd(fd_idx);
 
             io_rc = ytc->ytc_read ?
-                pread(fd, adjusted_buf, adjusted_io_len, adjusted_off) :
-                pwrite(fd, adjusted_buf, adjusted_io_len, adjusted_off);
+                YAPIO_SYS_CALL(pread)(fd, adjusted_buf, adjusted_io_len,
+                                      adjusted_off) :
+                YAPIO_SYS_CALL(pwrite)(fd, adjusted_buf, adjusted_io_len,
+                                       adjusted_off);
 
             log_msg(YAPIO_LL_DEBUG, "%s rc=%zd off=%lu@%d fr=%d",
                     ytc->ytc_read ? "pread" : "pwrite", io_rc, adjusted_off,
@@ -1166,7 +1255,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
             break;
         }
 
-        if (ytc->ytc_read)
+        if (ytc->ytc_read && yapioVerifyRead)
         {
             rc = yapio_verify_contents_of_io_buffer(yapioIOBuf,
                                                     ytg->ytg_blk_sz, md);
@@ -1204,7 +1293,7 @@ yapio_unlink_test_file(void)
     if (yapioKeepFile || (!fpp && !yapio_leader_rank()))
         return;
 
-    int rc = unlink(unlink_fn);
+    int rc = YAPIO_SYS_CALL(unlink)(unlink_fn);
     if (rc)
     {
         log_msg(YAPIO_LL_ERROR, "unlink %s: %s", unlink_fn, strerror(errno));
@@ -2079,9 +2168,23 @@ yapio_destroy_collection_and_reporting_threads(void)
         pthread_join(yapioStatsCollectionThread, NULL);
 }
 
+static void
+yapio_init_available_io_modes(void)
+{
+    yapio_io_modes[YAPIO_IO_MODE_DEFAULT] = &yapioDefaultSysCallOps;
+#ifdef YAPIO_IME
+    yapio_io_modes[YAPIO_IO_MODE_IME] = &yapioIMESysCallOps;
+#endif
+#ifdef YAPIO_MPIIO
+    yapio_io_modes[YAPIO_IO_MODE_MPIIO] = &yapioMPIIOSysCallOps;
+#endif
+}
+
 int
 main(int argc, char *argv[])
 {
+    yapio_init_available_io_modes();
+
     yapio_mpi_setup(argc, argv);
 
     yapio_getopts(argc, argv);
