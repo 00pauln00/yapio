@@ -951,7 +951,12 @@ yapio_getopts(int argc, char **argv)
                 printf("File not specified with option -i\n");
                 yapio_print_help(YAPIO_EXIT_ERR);
             }
-            snprintf(yapioTestFileName, PATH_MAX + 1, "%s", optarg);
+            int res = snprintf(yapioTestFileName, PATH_MAX + 1, "%s", optarg);
+            if (res == -1)
+            {
+                printf("Filename should be shorter than %d\n", PATH_MAX);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
             yapioInitFromMdFile = true;
             break;
         case 'k':
@@ -1120,9 +1125,17 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
     if (yapioInitFromMdFile)
         path_len = strlen(yapioTestFileName);
     else
+    {
         path_len = snprintf(yapioTestFileName, PATH_MAX, "%s/%s%d_%s",
                             yapioTestRootDir, yapioFilePrefix,
                             ytg->ytg_group_num, YAPIO_MKSTEMP_TEMPLATE);
+
+        /* check if output got truncated */
+        if (path_len == -1)
+            log_msg(YAPIO_LL_FATAL, "File name got truncated: %s",
+                    strerror(errno));
+    }
+
 
     if (path_len > PATH_MAX)
         log_msg(YAPIO_LL_FATAL, "%s", strerror(ENAMETOOLONG));
@@ -1272,21 +1285,29 @@ yapio_alloc_buffers(const yapio_test_group_t *ytg)
 static void
 yapio_initialize_source_md_buffer_from_file(const yapio_test_group_t *ytg)
 {
-    /* each rank reads its own md file 'md{rank}' */
-    char md_file[6];
-    snprintf(md_file, sizeof(int), "md%d", yapioMyRank);
+    int global_sum;
+
+    /* each rank reads its own md file '{filename}-md-{rank}' */
+    char md_file[PATH_MAX + 8];
+    snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
 
     int nblks_per_rank = ytg->ytg_num_blks_per_rank;
 
     FILE *file = fopen(md_file, "r");
+    int n = 0;
 
     if (file)
     {
+        n = 1;
         fread(yapioSourceBlkMd, sizeof(yapio_blk_md_t), nblks_per_rank, file);
         fclose(file);
     }
-    else
-        printf("Unable to read initial metadata state\n");
+
+    /* make sure each rank can read its md file */
+    MPI_Allreduce(&n, &global_sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (global_sum != yapioNumRanks)
+        log_msg(YAPIO_LL_FATAL, "%d rank(s) unable to open metadata file\n",
+                yapioNumRanks - global_sum);
 }
 
 static void
@@ -1521,6 +1542,7 @@ static void
 yapio_setup_buffers(const yapio_test_group_t *ytg)
 {
     yapio_alloc_buffers(ytg);
+
     yapio_initialize_source_md_buffer(ytg);
 }
 
@@ -2183,9 +2205,13 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
 static void
 yapio_store_md_final_state()
 {
-    /* each rank writes its own md file 'md{rank}' */
-    char md_file[6];
-    snprintf(md_file, sizeof(int), "md%d", yapioMyRank);
+    /* each rank writes its own md file '{filename}-md-{rank}' */
+    char md_file[PATH_MAX + 8];
+
+    int rc;
+    rc = snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
+    if (rc == -1)
+        log_msg(YAPIO_LL_FATAL, "Md filename got truncated: %d", rc)
 
     yapio_test_group_t *ytg = yapioMyTestGroup;
     const size_t nblks_per_rank = ytg->ytg_num_blks_per_rank;
@@ -2194,7 +2220,7 @@ yapio_store_md_final_state()
     int test_ctx_idf = ytg->ytg_num_contexts - 1;
     yapio_test_ctx_t *ytc = &ytg->ytg_contexts[test_ctx_idf];
 
-    FILE *file = fopen(md_file, "w+");
+    FILE *file = fopen(md_file, "w");
 
     if (file)
     {
@@ -2207,7 +2233,10 @@ yapio_store_md_final_state()
         fclose(file);
     }
     else
-        printf("Unable to open file\n");
+    {
+        printf("Unable to open md file\n");
+        yapio_print_help(YAPIO_EXIT_ERR);
+    }
 }
 
 static void
