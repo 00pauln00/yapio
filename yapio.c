@@ -1303,11 +1303,15 @@ yapio_initialize_source_md_buffer_from_file(const yapio_test_group_t *ytg)
         fclose(file);
     }
 
-    /* make sure each rank can read its md file */
-    MPI_Allreduce(&n, &global_sum, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    if (global_sum != yapioNumRanks)
-        log_msg(YAPIO_LL_FATAL, "%d rank(s) unable to open metadata file\n",
-                yapioNumRanks - global_sum);
+    /* rank 0 makes sure each rank can read its md file */
+    MPI_Reduce(&n, &global_sum, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (yapioMyRank == 0 && global_sum != yapioNumRanks)
+    {
+        printf("%d rank(s) unable to open metadata file\n",
+               yapioNumRanks - global_sum);
+        /* stop execution for all ranks */
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 }
 
 static void
@@ -2299,7 +2303,7 @@ yapio_exec_all_tests(void)
         yapio_send_test_results(ytc);
 
         /* each rank dumps last md array into a unique file */
-        if (i == yapioMyTestGroup->ytg_num_contexts - 1)
+        if (i == yapioMyTestGroup->ytg_num_contexts - 1 && yapioKeepFile)
             yapio_store_md_final_state();
 
         /* Free memory allocated in the test.
