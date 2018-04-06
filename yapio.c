@@ -29,7 +29,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:m:p:kt:PD:sFN"
+#define YAPIO_OPTS "b:n:hd:i:m:p:kt:PD:sFN"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -82,6 +82,7 @@ static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
 static bool        yapioVerifyRead = true;
 static const char *yapioTestFileNamePrefix = "";
+static bool        yapioInitFromMdFile = false;
 
 static pthread_t       yapioStatsCollectionThread;
 static pthread_t       yapioStatsReportingThread;
@@ -530,6 +531,8 @@ yapio_print_help(int exit_val)
                 "\t-d  Debugging level\n"
                 "\t-F  File per process\n"
                 "\t-h  Print help message\n"
+                "\t-i  Initialize metadata state from a given file\n"
+                "\t    Provide absolute file path\n"
                 "\t-k  Keep file after test completion\n"
                 "\t-m  I/O Mode - \n"
                 "\t    - P (posix (default))\n"
@@ -942,6 +945,20 @@ yapio_getopts(int argc, char **argv)
         case 'h':
             yapio_print_help(YAPIO_EXIT_OK);
             break;
+        case 'i':
+            if (optarg[0] == '-')
+            {
+                printf("File not specified with option -i\n");
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+            int res = snprintf(yapioTestFileName, PATH_MAX + 1, "%s", optarg);
+            if (res == -1)
+            {
+                printf("Filename should be shorter than %d\n", PATH_MAX);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+            yapioInitFromMdFile = true;
+            break;
         case 'k':
             yapioKeepFile = true;
             break;
@@ -1102,15 +1119,28 @@ yapio_open_fpp_file(int rank, int oflags)
 static void
 yapio_setup_test_file(const yapio_test_group_t *ytg)
 {
+    int path_len;
     yapio_verify_test_directory();
 
-    int path_len = snprintf(yapioTestFileName, PATH_MAX, "%s/%s%d_%s",
+    if (yapioInitFromMdFile)
+        path_len = strlen(yapioTestFileName);
+    else
+    {
+        path_len = snprintf(yapioTestFileName, PATH_MAX, "%s/%s%d_%s",
                             yapioTestRootDir, yapioFilePrefix,
                             ytg->ytg_group_num, YAPIO_MKSTEMP_TEMPLATE);
+
+        /* check if output got truncated */
+        if (path_len == -1)
+            log_msg(YAPIO_LL_FATAL, "File name got truncated: %s",
+                    strerror(errno));
+    }
+
+
     if (path_len > PATH_MAX)
         log_msg(YAPIO_LL_FATAL, "%s", strerror(ENAMETOOLONG));
 
-    if (yapio_leader_rank())
+    if (yapio_leader_rank() && !yapioInitFromMdFile)
     {
         yapioFileDesc = mkstemp(yapioTestFileName);
         if (yapioFileDesc < 0)
@@ -1251,9 +1281,48 @@ yapio_alloc_buffers(const yapio_test_group_t *ytg)
         yapio_destroy_buffers_and_abort();
 }
 
+/* read input md file to initialize yapioMyRank's md array */
+static void
+yapio_initialize_source_md_buffer_from_file(const yapio_test_group_t *ytg)
+{
+    int global_sum;
+
+    /* each rank reads its own md file '{filename}-md-{rank}' */
+    char md_file[PATH_MAX + 8];
+    snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
+
+    int nblks_per_rank = ytg->ytg_num_blks_per_rank;
+
+    FILE *file = fopen(md_file, "r");
+    int n = 0;
+
+    if (file)
+    {
+        n = 1;
+        fread(yapioSourceBlkMd, sizeof(yapio_blk_md_t), nblks_per_rank, file);
+        fclose(file);
+    }
+
+    /* rank 0 makes sure each rank can read its md file */
+    MPI_Reduce(&n, &global_sum, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (yapioMyRank == 0 && global_sum != yapioNumRanks)
+    {
+        printf("%d rank(s) unable to open metadata file\n",
+               yapioNumRanks - global_sum);
+        /* stop execution for all ranks */
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
 static void
 yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
 {
+    if (yapioInitFromMdFile)
+    {
+        yapio_initialize_source_md_buffer_from_file(ytg);
+        return;
+    }
+
     int rel_rank = yapio_relative_rank_get(ytg, 0);
     size_t i;
 
@@ -1477,6 +1546,7 @@ static void
 yapio_setup_buffers(const yapio_test_group_t *ytg)
 {
     yapio_alloc_buffers(ytg);
+
     yapio_initialize_source_md_buffer(ytg);
 }
 
@@ -2135,6 +2205,44 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
     }
 }
 
+/* dump yapioMyRank's metadata array into a file */
+static void
+yapio_store_md_final_state()
+{
+    /* each rank writes its own md file '{filename}-md-{rank}' */
+    char md_file[PATH_MAX + 8];
+
+    int rc;
+    rc = snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
+    if (rc == -1)
+        log_msg(YAPIO_LL_FATAL, "Md filename got truncated: %d", rc)
+
+    yapio_test_group_t *ytg = yapioMyTestGroup;
+    const size_t nblks_per_rank = ytg->ytg_num_blks_per_rank;
+
+    /* use metadata from last iteration */
+    int test_ctx_idf = ytg->ytg_num_contexts - 1;
+    yapio_test_ctx_t *ytc = &ytg->ytg_contexts[test_ctx_idf];
+
+    FILE *file = fopen(md_file, "w");
+
+    if (file)
+    {
+        int num_ops_in = 0;
+
+        const yapio_blk_md_t *md_array =
+            yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_OUT, &num_ops_in);
+
+        fwrite(md_array, sizeof(yapio_blk_md_t), nblks_per_rank, file);
+        fclose(file);
+    }
+    else
+    {
+        printf("Unable to open md file\n");
+        yapio_print_help(YAPIO_EXIT_ERR);
+    }
+}
+
 static void
 yapio_exec_all_tests(void)
 {
@@ -2193,6 +2301,10 @@ yapio_exec_all_tests(void)
 
         yapio_gather_test_barrier_results(ytc);
         yapio_send_test_results(ytc);
+
+        /* each rank dumps last md array into a unique file */
+        if (i == yapioMyTestGroup->ytg_num_contexts - 1 && yapioKeepFile)
+            yapio_store_md_final_state();
 
         /* Free memory allocated in the test.
          */
