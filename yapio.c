@@ -2046,6 +2046,19 @@ yapio_verify_test_contexts(yapio_test_group_t *ytg)
     {
         yapio_test_ctx_t *ytc = &ytg->ytg_contexts[i];
 
+        if (!i && ytc->ytc_read && !yapioInitFromMdFile)
+        {
+            if (yapio_leader_rank())
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "If -i <file> is not specified, the first test may not be a read.");
+            }
+            else
+            {
+                yapio_exit(-EINVAL);
+            }
+        }
+
         if ((ytc->ytc_io_pattern == YAPIO_IOP_RANDOM ||
              ytc->ytc_io_pattern == YAPIO_IOP_STRIDED) &&
             ytg->ytg_num_blks_per_rank % ytg->ytg_num_ranks)
