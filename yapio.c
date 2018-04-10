@@ -1281,29 +1281,89 @@ yapio_alloc_buffers(const yapio_test_group_t *ytg)
         yapio_destroy_buffers_and_abort();
 }
 
+yapio_blk_md_t *
+yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
+                           enum yapio_test_ctx_mdh_in_out, int *);
+
+static int
+yapio_md_buffer_io(const yapio_test_group_t *ytg, const bool dump)
+{
+    /* each rank writes its own md file '{filename}-md-{rank}' */
+    char md_file[PATH_MAX];
+
+    int rc = snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName,
+                      yapioMyRank);
+    if (rc >= PATH_MAX || rc == -1)
+    {
+        log_msg(YAPIO_LL_ERROR, "Md filename is too long");
+        return -ENAMETOOLONG;
+    }
+
+    const size_t nblks_per_rank = ytg->ytg_num_blks_per_rank;
+
+    FILE *file = fopen(md_file, dump ? "w" : "r");
+    if (!file)
+    {
+        int rc = -errno;
+        log_msg(YAPIO_LL_ERROR, "fopen(`%s'): %s", md_file, strerror(errno));
+        return rc;
+    }
+
+    yapio_blk_md_t *md_array;
+    if (dump)
+    {
+        /* use metadata from last iteration */
+        int test_ctx_idf = ytg->ytg_num_contexts - 1;
+        const yapio_test_ctx_t *ytc = &ytg->ytg_contexts[test_ctx_idf];
+
+        md_array = yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_OUT,
+                                              NULL);
+        if (!md_array)
+            md_array = yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                                  NULL);
+    }
+    else
+    {
+        md_array = yapioSourceBlkMd;
+    }
+
+    log_msg(YAPIO_LL_DEBUG, "%p %d", md_array, ytg->ytg_num_contexts);
+
+    size_t io_rc = dump ?
+        fwrite(md_array, sizeof(yapio_blk_md_t), nblks_per_rank, file) :
+        fread(md_array, sizeof(yapio_blk_md_t), nblks_per_rank, file);
+
+    if (io_rc != nblks_per_rank)
+    {
+        int rc = -errno;
+        log_msg(YAPIO_LL_ERROR, "%s(`%s'): %s (%zu / %zu)",
+                dump ? "fwrite" : "fread", md_file, strerror(errno),
+                io_rc, nblks_per_rank);
+
+        return rc;
+    }
+
+    if (fclose(file))
+    {
+        int rc = -errno;
+        log_msg(YAPIO_LL_ERROR, "fclose(`%s'): %s", md_file,
+                strerror(errno));
+        return rc;
+    }
+
+    return 0;
+}
+
 /* read input md file to initialize yapioMyRank's md array */
 static void
 yapio_initialize_source_md_buffer_from_file(const yapio_test_group_t *ytg)
 {
-    int global_sum;
-
-    /* each rank reads its own md file '{filename}-md-{rank}' */
-    char md_file[PATH_MAX + 8];
-    snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
-
-    int nblks_per_rank = ytg->ytg_num_blks_per_rank;
-
-    FILE *file = fopen(md_file, "r");
-    int n = 0;
-
-    if (file)
-    {
-        n = 1;
-        fread(yapioSourceBlkMd, sizeof(yapio_blk_md_t), nblks_per_rank, file);
-        fclose(file);
-    }
+    if (yapio_md_buffer_io(ytg, false))
+        log_msg(YAPIO_LL_FATAL, "yapio_md_buffer_io() failed");
 
     /* rank 0 makes sure each rank can read its md file */
+    int n = 1;
+    int global_sum = 0;
     MPI_Reduce(&n, &global_sum, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (yapioMyRank == 0 && global_sum != yapioNumRanks)
     {
@@ -1318,10 +1378,7 @@ static void
 yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
 {
     if (yapioInitFromMdFile)
-    {
-        yapio_initialize_source_md_buffer_from_file(ytg);
-        return;
-    }
+        return yapio_initialize_source_md_buffer_from_file(ytg);
 
     int rel_rank = yapio_relative_rank_get(ytg, 0);
     size_t i;
@@ -2207,40 +2264,10 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
 
 /* dump yapioMyRank's metadata array into a file */
 static void
-yapio_store_md_final_state()
+yapio_store_md_final_state(void)
 {
-    /* each rank writes its own md file '{filename}-md-{rank}' */
-    char md_file[PATH_MAX + 8];
-
-    int rc;
-    rc = snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName, yapioMyRank);
-    if (rc == -1)
-        log_msg(YAPIO_LL_FATAL, "Md filename got truncated: %d", rc)
-
-    yapio_test_group_t *ytg = yapioMyTestGroup;
-    const size_t nblks_per_rank = ytg->ytg_num_blks_per_rank;
-
-    /* use metadata from last iteration */
-    int test_ctx_idf = ytg->ytg_num_contexts - 1;
-    yapio_test_ctx_t *ytc = &ytg->ytg_contexts[test_ctx_idf];
-
-    FILE *file = fopen(md_file, "w");
-
-    if (file)
-    {
-        int num_ops_in = 0;
-
-        const yapio_blk_md_t *md_array =
-            yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_OUT, &num_ops_in);
-
-        fwrite(md_array, sizeof(yapio_blk_md_t), nblks_per_rank, file);
-        fclose(file);
-    }
-    else
-    {
-        printf("Unable to open md file\n");
-        yapio_print_help(YAPIO_EXIT_ERR);
-    }
+    if (yapio_md_buffer_io(yapioMyTestGroup, true))
+        log_msg(YAPIO_LL_FATAL, "yapio_md_buffer_io() failed");
 }
 
 static void
