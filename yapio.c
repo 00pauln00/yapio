@@ -292,8 +292,10 @@ static int                 yapioNumTestGroups;
 static int
 yapio_relative_rank_get(const yapio_test_group_t *ytg, int idx_shift)
 {
-    return
-        (yapioMyRank - ytg->ytg_first_rank + idx_shift) % ytg->ytg_num_ranks;
+    int rank = (yapioMyRank - ytg->ytg_first_rank + idx_shift) %
+        ytg->ytg_num_ranks;
+
+    return rank < 0 ? (ytg->ytg_num_ranks - 1) : rank;
 }
 
 static const char *
@@ -1402,6 +1404,8 @@ yapio_source_md_update_writer_rank(size_t source_md_idx, int new_writer_rank)
         log_msg(YAPIO_LL_FATAL, "out of bounds source_md_idx=%zu",
                 source_md_idx);
 
+    log_msg(YAPIO_LL_TRACE, "%d %zu", new_writer_rank, source_md_idx);
+
     yapioSourceBlkMd[source_md_idx].ybm_writer_rank = new_writer_rank;
 }
 
@@ -1735,7 +1739,10 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
 
     int rc = yapio_read_from_dev_urandom((void *)array_of_randoms, buf_sz);
     if (rc)
+    {
+        free(array_of_randoms);
         return rc;
+    }
 
     size_t i;
     if (initialize_md_out)
@@ -1918,9 +1925,22 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
         {
             for (src_idx = 0; src_idx < nblks_per_rank; src_idx++)
             {
-                int rank = src_idx / nblks_div_nranks;
+                const int rank = src_idx / nblks_div_nranks;
 
-                yapio_source_md_update_writer_rank(src_idx, rank);
+                log_msg(YAPIO_LL_TRACE,
+                        "%zu: blk-num:%zu:%zu old-rank=%d new-rank=%d",
+                        src_idx, md_send[src_idx].ybm_blk_number,
+                        yapioSourceBlkMd[src_idx].ybm_blk_number,
+                        md_send[src_idx].ybm_writer_rank,
+                        rank);
+
+                /* This rank's yapioSourceBlkMd array must be updated with the
+                 * rank which is about to write this block.
+                 */
+                const size_t update_idx =
+                    md_send[src_idx].ybm_blk_number % nblks_per_rank;
+
+                yapio_source_md_update_writer_rank(update_idx, rank);
                 md_send[src_idx].ybm_writer_rank = rank;
             }
         }
