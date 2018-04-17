@@ -533,8 +533,8 @@ yapio_print_help(int exit_val)
                 "\t-d  Debugging level\n"
                 "\t-F  File per process\n"
                 "\t-h  Print help message\n"
-                "\t-i  Initialize metadata state from a given file\n"
-                "\t    Provide absolute file path\n"
+                "\t-i  Resume from a previous test\n"
+                "\t    Provide file suffix used in the previous test\n"
                 "\t-k  Keep file after test completion\n"
                 "\t-m  I/O Mode - \n"
                 "\t    - P (posix (default))\n"
@@ -1293,8 +1293,14 @@ yapio_md_buffer_io(const yapio_test_group_t *ytg, const bool dump)
     /* each rank writes its own md file '{filename}-md-{rank}' */
     char md_file[PATH_MAX];
 
-    int rc = snprintf(md_file, PATH_MAX, "%s-md-%d", yapioTestFileName,
+    /* md files are hidden in folder where test is launched
+     * note: yapioTestFileName starts with './' */
+    char filename_hidden[PATH_MAX] = "./.";
+    strncpy(filename_hidden + 3, yapioTestFileName + 2, PATH_MAX);
+
+    int rc = snprintf(md_file, PATH_MAX, "%s-md-%d", filename_hidden,
                       yapioMyRank);
+
     if (rc >= PATH_MAX || rc == -1)
     {
         log_msg(YAPIO_LL_ERROR, "Md filename is too long");
