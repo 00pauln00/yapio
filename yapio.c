@@ -1192,8 +1192,10 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         for (i = 0; i < yapioNumRanks; i++)
             yapioFileDescFpp[i] = -1;
 
-        int rc = yapio_open_fpp_file(yapio_relative_rank_get(ytg, 0),
-                                     O_CREAT | O_EXCL | O_RDWR);
+        const int flags = yapioInitFromMdFile ?
+            O_RDWR : (O_CREAT | O_EXCL | O_RDWR);
+
+        int rc = yapio_open_fpp_file(yapio_relative_rank_get(ytg, 0), flags);
         if (rc)
             log_msg(YAPIO_LL_FATAL, "yapio_open_fpp_file: %s", strerror(-rc));
 
