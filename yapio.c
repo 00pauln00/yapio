@@ -26,6 +26,21 @@
 #include <im_client_native2.h>
 #endif
 
+#define YAPIO_CALLOC(n, size)                                           \
+    ({                                                                  \
+        void *buf = calloc(n, size);                                    \
+        log_msg(YAPIO_LL_DEBUG, "alloc: %p %zu", buf, (n * size));      \
+        buf;                                                            \
+    })
+
+#define YAPIO_MALLOC(size) YAPIO_CALLOC(1, size);
+
+#define YAPIO_FREE(ptr)                             \
+    {                                               \
+        free((ptr));                                \
+        log_msg(YAPIO_LL_DEBUG, "free: %p", (ptr)); \
+    }
+
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
@@ -210,7 +225,6 @@ yapio_get_blk_magic(size_t blk_num)
 typedef struct yapio_blk_metadata
 {
     int    ybm_writer_rank;     //rank who has last written this block
-    int    ybm_write_iteration; //iteration number of last write
     int    ybm_owner_rank_fpp;  //fpp only, file to which contents belong
     size_t ybm_blk_number;      //number of the block - should not change!
 } yapio_blk_md_t;
@@ -784,7 +798,7 @@ yapio_test_group_mpi_group_init(int start_rank, yapio_test_group_t *ytg)
         return rc;
     }
 
-    int *ranks = calloc(ytg->ytg_num_ranks, sizeof(int));
+    int *ranks = YAPIO_CALLOC(ytg->ytg_num_ranks, sizeof(int));
     if (!ranks)
         return -errno;
 
@@ -795,7 +809,7 @@ yapio_test_group_mpi_group_init(int start_rank, yapio_test_group_t *ytg)
     rc = MPI_Group_incl(group_world, ytg->ytg_num_ranks, ranks,
                         &ytg->ytg_group);
 
-    free(ranks);
+    YAPIO_FREE(ranks);
 
     if (rc != MPI_SUCCESS)
     {
@@ -1188,7 +1202,7 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         if (yapio_leader_rank())
             unlink(yapioTestFileName);
 
-        yapioFileDescFpp = malloc(yapioNumRanks * sizeof(int));
+        yapioFileDescFpp = YAPIO_CALLOC(yapioNumRanks, sizeof(int));
         if (!yapioFileDescFpp)
             log_msg(YAPIO_LL_FATAL, "%s", strerror(errno));
 
@@ -1269,10 +1283,10 @@ static void
 yapio_destroy_buffers(void)
 {
     if (yapioSourceBlkMd)
-        free(yapioSourceBlkMd);
+        YAPIO_FREE(yapioSourceBlkMd);
 
     if (yapioIOBuf)
-        free(yapioIOBuf);
+        YAPIO_FREE(yapioIOBuf);
 }
 
 static void
@@ -1285,12 +1299,12 @@ yapio_destroy_buffers_and_abort(void)
 static void
 yapio_alloc_buffers(const yapio_test_group_t *ytg)
 {
-    yapioSourceBlkMd = calloc(ytg->ytg_num_blks_per_rank,
-                              sizeof(yapio_blk_md_t));
+    yapioSourceBlkMd = YAPIO_CALLOC(ytg->ytg_num_blks_per_rank,
+                                    sizeof(yapio_blk_md_t));
     if (yapioSourceBlkMd == NULL)
         yapio_destroy_buffers_and_abort();
 
-    yapioIOBuf = calloc(1, ytg->ytg_blk_sz);
+    yapioIOBuf = YAPIO_CALLOC(1, ytg->ytg_blk_sz);
     if (yapioIOBuf == NULL)
         yapio_destroy_buffers_and_abort();
 }
@@ -1652,7 +1666,7 @@ yapio_test_ctx_release_md(yapio_test_ctx_md_t *ytcmh)
 {
     if (ytcmh->ytcmh_ops)
     {
-        free(ytcmh->ytcmh_ops);
+        YAPIO_FREE(ytcmh->ytcmh_ops);
         ytcmh->ytcmh_ops = NULL;
     }
 }
@@ -1709,7 +1723,7 @@ yapio_test_context_alloc(yapio_test_ctx_t *ytc,
     yapio_test_ctx_md_t *ytcmh = &ytc->ytc_in_out_md_ops[in_out];
 
     ytcmh->ytcmh_num_ops = nblks;
-    ytcmh->ytcmh_ops = calloc(nblks, sizeof(yapio_blk_md_t));
+    ytcmh->ytcmh_ops = YAPIO_CALLOC(nblks, sizeof(yapio_blk_md_t));
 
     return ytcmh->ytcmh_ops;
 }
@@ -1749,14 +1763,14 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
                        size_t num_mds, bool initialize_md_out)
 {
     size_t buf_sz = num_mds * sizeof(int);
-    int *array_of_randoms = malloc(buf_sz);
+    int *array_of_randoms = YAPIO_MALLOC(buf_sz);
     if (!array_of_randoms)
         return -ENOMEM;
 
     int rc = yapio_read_from_dev_urandom((void *)array_of_randoms, buf_sz);
     if (rc)
     {
-        free(array_of_randoms);
+        YAPIO_FREE(array_of_randoms);
         return rc;
     }
 
@@ -1783,7 +1797,7 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
                 md_out[i].ybm_blk_number);
     }
 
-    free(array_of_randoms);
+    YAPIO_FREE(array_of_randoms);
 
     return 0;
 }
@@ -2152,7 +2166,7 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
 
         /* This node is rank0 and will gather the timers for reporting.
          */
-        all_barrier_timers = calloc(yapioNumRanks, sizeof(yapio_timer_t));
+        all_barrier_timers = YAPIO_CALLOC(yapioNumRanks, sizeof(yapio_timer_t));
 
         if (!all_barrier_timers)
             log_msg(YAPIO_LL_FATAL, "calloc: %s", strerror(ENOMEM));
@@ -2194,7 +2208,7 @@ yapio_gather_barrier_stats(const yapio_timer_t *barrier_timer_this_rank,
         barrier_global_results[YAPIO_BARRIER_STATS_MED] =
             yapio_timer_to_float(&all_barrier_timers[yapioNumRanks / 2]);
 
-        free(all_barrier_timers);
+        YAPIO_FREE(all_barrier_timers);
     }
 }
 
