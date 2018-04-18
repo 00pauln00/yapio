@@ -2559,6 +2559,27 @@ yapio_init_available_io_modes(void)
 #endif
 }
 
+static void
+yapio_io_mode_init(void)
+{
+#ifdef YAPIO_IME
+    if (yapioModeCurrent == YAPIO_IO_MODE_IME)
+        return ime_client_native2_init();
+#endif
+    return;
+}
+
+static int
+yapio_io_mode_finalize(void)
+{
+#ifdef YAPIO_IME
+    if (yapioModeCurrent == YAPIO_IO_MODE_IME)
+        return ime_client_native2_finalize();
+#endif
+
+    return 0;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2571,6 +2592,8 @@ main(int argc, char *argv[])
     yapio_assign_rank_to_group();
 
     yapio_verify_test_contexts(yapioMyTestGroup);
+
+    yapio_io_mode_init();
 
     yapio_setup_buffers(yapioMyTestGroup);
 
@@ -2594,7 +2617,7 @@ main(int argc, char *argv[])
 
     yapio_unlink_test_file();
 
-    yapio_exit(YAPIO_EXIT_OK);
+    yapio_exit(yapio_io_mode_finalize());
 
     return 0;
 }
