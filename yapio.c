@@ -383,10 +383,7 @@ yapio_mmap_open(const char *file, int flags, mode_t mode)
                   (yapioMyTestGroup->ytg_file_per_process ?
                    1 : yapioMyTestGroup->ytg_num_ranks));
 
-    int mmap_flags = yapioMyTestGroup->ytg_file_per_process ?
-        MAP_SHARED : MAP_PRIVATE;
-
-    void *addr = mmap(NULL, len, prot, mmap_flags, fd, 0);
+    void *addr = mmap(NULL, len, prot, MAP_SHARED, fd, 0);
     if (addr == NULL)
     {
         const int error = errno;

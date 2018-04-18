@@ -44,6 +44,13 @@ run_cmd mpirun -np 4 ./yapio -t n16:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
 
 run_cmd mpirun -np 8 ./yapio -t N7:B8:n$((16*7)):wsL,rsL,wRL,rRD,wRD,rsL,rsD -t wsL ${TEST_DIR}
 
+# Use mmap
+run_cmd mpirun -np 8 ./yapio -mm -t F:B512:wsL,rsL,wRL,rRD,wRD,rsL,rsD \
+    ${TEST_DIR}
+
+run_cmd mpirun -np 8 ./yapio -mm -t B4096:wsL,rsL,wRL,rRD,wRD,rsL,rsD \
+    ${TEST_DIR}
+
 # Launch a compound test
 run_cmd mpirun -np 8 ./yapio -t wsL,rsL,wRL,rRD,wRD,rsL,rsD \
     -t F:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
@@ -87,9 +94,9 @@ do
 
     MD5SUM=MD5SUM_NEW
 done
-# Last run and cleanup
-run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} \
-    -t F:N4:B4096:rsL,wRD ${TEST_DIR}
+# Last run (with mmap) and cleanup
+run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} -mm -t F:N4:B4096:rsL,rRD,rSD \
+    ${TEST_DIR}
 
 stat ${TEST_DIR}/.yapio.${SUFFIXa}.0.md 2>/dev/null >/dev/null
 if [ $? -eq 0 ]
@@ -104,7 +111,6 @@ then
     echo "Failed to remove md file: ${TEST_DIR}/.yapio.${SUFFIXb}.0.md"
     exit 1;
 fi
-
 
 #ls -lrt ${TEST_DIR}
 
