@@ -10,3 +10,6 @@ asan :
 
 clean :
 	rm -f yapio.o yapio
+
+test : yapio
+	./yapio_tests.sh
