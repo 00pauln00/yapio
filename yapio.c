@@ -44,7 +44,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:i:m:p:kt:PD:sFN:S:"
+#define YAPIO_OPTS "b:n:hd:i:m:t:PD:sN:S:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -54,6 +54,7 @@
 #define YAPIO_MKSTEMP_TEMPLATE     "XXXXXX"
 #define YAPIO_MKSTEMP_TEMPLATE_LEN 6
 #define YAPIO_DECOMPOSE_MAX        8
+#define YAPIO_RECIPE_PARAM_STRLEN_MAX 65
 
 enum yapio_log_levels
 {
@@ -78,11 +79,8 @@ enum yapio_patterns
 
 static size_t      yapioNumBlksPerRank = YAPIO_DEF_NBLKS_PER_PE;
 static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
-static char       *yapioFilePrefix     = YAPIO_DEFAULT_FILE_PREFIX;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
-static bool        yapioKeepFile       = false;
-static bool        yapioFilePerProcess = false;
 static bool        yapioPolluteBlks    = false;
 static bool        yapioDisplayStats   = false;
 static int         yapioDecomposeCnt   = 0;
@@ -98,8 +96,6 @@ static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
 static bool        yapioVerifyRead = true;
 static const char *yapioTestFileNamePrefix = "";
-static bool        yapioInitFromMdFile = false;
-static char        yapioMkstempSuffix[YAPIO_MKSTEMP_TEMPLATE_LEN + 1];
 static int         yapioStoneWallNsecs;
 static bool        yapioStoneWalled = false;
 static bool        yapioUseStoneWalling = false;
@@ -307,8 +303,13 @@ typedef struct yapio_test_group
     size_t           ytg_num_blks_per_rank;
     size_t           ytg_blk_sz;
     bool             ytg_file_per_process;
+    bool             ytg_keep_file;
     bool             ytg_leader_rank;
+    bool             ytg_restart_from_previous_job;
     int              ytg_last_writer_ctx;
+    char             ytg_suffix[YAPIO_MKSTEMP_TEMPLATE_LEN + 1];
+    char             ytg_prefix[YAPIO_RECIPE_PARAM_STRLEN_MAX + 1];
+    char             ytg_target_dir[PATH_MAX + 1];
 } yapio_test_group_t;
 
 static yapio_test_group_t *yapioMyTestGroup;
@@ -556,29 +557,34 @@ yapio_print_help(int exit_val)
                 "\t-d  Debugging level\n"
                 "\t-F  File per process\n"
                 "\t-h  Print help message\n"
-                "\t-i  Resume from a previous test\n"
-                "\t    Provide file suffix used in the previous test\n"
-                "\t-k  Keep file after test completion\n"
                 "\t-m  I/O Mode - \n"
                 "\t    - P (posix (default))\n"
                 "\t    - I (IME native)\n"
                 "\t    - m (mmap)\n"
                 "\t-n  Number of blocks per task\n"
                 "\t-N  Disable read verification\n"
-                "\t-p  File name prefix\n"
                 "\t-s  Display test duration and barrier wait times\n"
-                "\t-S  Number of seconds before stonewalling\n"
+                "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
+                "\t    - Prefix:     P{prefix}\n"
+                "\t    - Restart:    X{suffix}\n"
                 "\t    - Pattern:    sequential (s), random (R), strided (S)\n"
                 "\t    - I/O Op:     read (r), write (w)\n"
                 "\t    - Locality:   local (L), distributed (D)\n"
                 "\t    - Options:    backwards (b), holes (h), no-fsync (f)\n"
-                "\t    - Parameters: block size (B), blocks per rank (n),\n"
-                "\t                  num ranks (N), file-per-process (F)\n"
+                "\t    - Parameters: block-size (B), blocks-per-rank (n),\n"
+                "\t                  num-ranks (N), file-per-process (F)\n"
+                "\t                  keep-file (K)\n"
                 "\n\t    Example: -t wsL,rRD\n"
                 "\t      sequential write, distribute reads randomly\n"
+                "\n\t    Example: -t K:F:wsL\n"
+                "\t      Use file-per-process and keep output files.\n"
                 "\n\t    Example: -t wsL,rRD -t N4:B4096:F:ws,rsb\n"
-                "\t      Run two tests simultaneously\n",
+                "\t      Run two tests simultaneously\n"
+                "\n\t    Example: -t Pmy-test-name:wsL,rRD\n"
+                "\t      Prefix output files with 'my-test-name'\n"
+                "\n\t    Example: -t Xabc123:rRD,rsL,rSD,wRD\n"
+                "\t      Restart from previous yapio instance 'abc123'\n\n",
                 yapioExecName);
 
     exit(exit_val);
@@ -594,17 +600,14 @@ yapio_mpi_setup(int argc, char **argv)
     yapioMpiInit = true;
 }
 
-#define YAPIO_RECIPE_PARAM_STRLEN_MAX 17
-
 static int
-yapio_test_recipe_param_to_ull(const char *param_str, size_t *result)
+yapio_test_recipe_param_gather(const char *param_str, char *buf)
 {
-    char recipe_param_tmp_str[YAPIO_RECIPE_PARAM_STRLEN_MAX];
     int j;
 
     for (j = 0; j < YAPIO_RECIPE_PARAM_STRLEN_MAX - 1 && param_str[j] != ':';
          j++)
-        recipe_param_tmp_str[j] = param_str[j];
+        buf[j] = param_str[j];
 
     if (param_str[j] != ':')
     {
@@ -616,14 +619,38 @@ yapio_test_recipe_param_to_ull(const char *param_str, size_t *result)
         return -EINVAL;
     }
 
-    recipe_param_tmp_str[j] = '\0';
+    buf[j] = '\0';
+
+    return j + 1; //include ':' char
+}
+
+static int
+yapio_test_recipe_param_to_ull(const char *param_str, size_t *result)
+{
+    char recipe_param_tmp_str[YAPIO_RECIPE_PARAM_STRLEN_MAX];
+
+    int len = yapio_test_recipe_param_gather(param_str, recipe_param_tmp_str);
 
     if (result)
         *result = strtoull(recipe_param_tmp_str, NULL, 10);
 
-    log_msg_r0(YAPIO_LL_TRACE, "%s %zu", recipe_param_tmp_str, *result);
+    log_msg_r0(YAPIO_LL_DEBUG, "%s %zu", recipe_param_tmp_str, *result);
 
-    return j + 1; //include ':' char
+    return len;
+}
+
+static int
+yapio_test_recipe_param_to_string(const char *param_str, char *dest)
+{
+    char recipe_param_tmp_str[YAPIO_RECIPE_PARAM_STRLEN_MAX];
+
+    int len = yapio_test_recipe_param_gather(param_str, recipe_param_tmp_str);
+
+    strncpy(dest, recipe_param_tmp_str, len);
+
+    log_msg_r0(YAPIO_LL_DEBUG, "%s", dest);
+
+    return len;
 }
 
 static void
@@ -632,8 +659,11 @@ yapio_test_group_init(yapio_test_group_t *ytg)
     ytg->ytg_num_contexts = 1;
     ytg->ytg_num_blks_per_rank = yapioNumBlksPerRank;
     ytg->ytg_blk_sz = yapioBlkSz;
-    ytg->ytg_file_per_process = yapioFilePerProcess;
+    ytg->ytg_file_per_process = false;
+    ytg->ytg_restart_from_previous_job = false;
     ytg->ytg_group_num = yapioNumTestGroups;
+    strncpy(ytg->ytg_prefix, YAPIO_DEFAULT_FILE_PREFIX,
+            YAPIO_RECIPE_PARAM_STRLEN_MAX);
 }
 
 #define YAPIO_RECIPE_STRLEN_MAX 4097
@@ -674,6 +704,15 @@ yapio_parse_test_recipe(const char *recipe_str)
         {
         /* Recipe specific parameters (B,n,N,F) which are separated by ':'
          */
+        case 'P':
+            i += yapio_test_recipe_param_to_string(&recipe_str[i + 1],
+                                                   ytg->ytg_prefix);
+            break;
+        case 'X':
+            i += yapio_test_recipe_param_to_string(&recipe_str[i + 1],
+                                                   ytg->ytg_suffix);
+            ytg->ytg_restart_from_previous_job = true;
+            break;
         case 'B':
             i += yapio_test_recipe_param_to_ull(&recipe_str[i + 1],
                                                 &ytg->ytg_blk_sz);
@@ -685,6 +724,10 @@ yapio_parse_test_recipe(const char *recipe_str)
         case 'N':
             i += yapio_test_recipe_param_to_ull(&recipe_str[i + 1], &tmp);
             ytg->ytg_num_ranks = (int)tmp;
+            break;
+        case 'K':
+            ytg->ytg_keep_file = true;
+            i++;
             break;
         case 'F':
             ytg->ytg_file_per_process = true;
@@ -965,30 +1008,8 @@ yapio_getopts(int argc, char **argv)
         case 'd':
             yapioDbgLevel = MIN(atoi(optarg), YAPIO_LL_MAX);
             break;
-        case 'F':
-            yapioFilePerProcess = true;
-            break;
         case 'h':
             yapio_print_help(YAPIO_EXIT_OK);
-            break;
-        case 'i':
-            if (optarg[0] == '-')
-            {
-                fprintf(stderr, "File not specified with option -i\n");
-                yapio_print_help(YAPIO_EXIT_ERR);
-            }
-            else if (strnlen(optarg, YAPIO_MKSTEMP_TEMPLATE_LEN + 1) >
-                     YAPIO_MKSTEMP_TEMPLATE_LEN)
-            {
-                fprintf(stderr, "Provided suffix is too long\n");
-                yapio_print_help(YAPIO_EXIT_ERR);
-            }
-
-            strncpy(yapioMkstempSuffix, optarg, YAPIO_MKSTEMP_TEMPLATE_LEN);
-            yapioInitFromMdFile = true;
-            break;
-        case 'k':
-            yapioKeepFile = true;
             break;
         case 'm':
             yapioSysCallOps = yapio_parse_io_mode(optarg);
@@ -998,9 +1019,6 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'n':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
-            break;
-        case 'p':
-            yapioFilePrefix = optarg;
             break;
         case 'P':
             yapioPolluteBlks = true;
@@ -1062,8 +1080,6 @@ yapio_getopts(int argc, char **argv)
 
     if (yapio_global_leader_rank())
     {
-        log_msg(YAPIO_LL_DEBUG, "prefix=%s dirname=%s",
-                yapioFilePrefix, yapioTestRootDir);
         log_msg(YAPIO_LL_DEBUG, "rank=%d num_ranks=%d",
                 yapioMyRank, yapioNumRanks);
     }
@@ -1154,12 +1170,12 @@ yapio_open_fpp_file(int rank, int oflags)
  *    the name the to the other ranks who will then also open the temp file.
  */
 static void
-yapio_setup_test_file(const yapio_test_group_t *ytg)
+yapio_setup_test_file(yapio_test_group_t *ytg)
 {
     yapio_verify_test_directory();
 
     int path_len = snprintf(yapioTestFileName, PATH_MAX, "%s/%s%s",
-                            yapioTestRootDir, yapioFilePrefix,
+                            yapioTestRootDir, ytg->ytg_prefix,
                             YAPIO_MKSTEMP_TEMPLATE);
 
     /* check if output got truncated */
@@ -1170,7 +1186,7 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
     if (path_len > PATH_MAX)
         log_msg(YAPIO_LL_FATAL, "%s", strerror(ENAMETOOLONG));
 
-    if (!yapioInitFromMdFile)
+    if (!ytg->ytg_restart_from_previous_job)
     {
         if (yapio_leader_rank())
         {
@@ -1181,9 +1197,9 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
             if (yapioModeCurrent == YAPIO_IO_MODE_MMAP &&
                 !ytg->ytg_file_per_process)
             {
-                size_t len = (yapioMyTestGroup->ytg_num_blks_per_rank *
-                              yapioMyTestGroup->ytg_blk_sz *
-                              yapioMyTestGroup->ytg_num_ranks);
+                size_t len = (ytg->ytg_num_blks_per_rank *
+                              ytg->ytg_blk_sz *
+                              ytg->ytg_num_ranks);
 
                 if (ftruncate(yapioFileDesc, len))
                 {
@@ -1196,7 +1212,7 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
              */
             close(yapioFileDesc);
 
-            strncpy(yapioMkstempSuffix,
+            strncpy(ytg->ytg_suffix,
                     &yapioTestFileName[path_len - YAPIO_MKSTEMP_TEMPLATE_LEN],
                     YAPIO_MKSTEMP_TEMPLATE_LEN);
 
@@ -1206,13 +1222,14 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
          * mkstemp().
          */
         MPI_OP_START;
-        MPI_Bcast(yapioMkstempSuffix, YAPIO_MKSTEMP_TEMPLATE_LEN, MPI_CHAR, 0,
-                  yapioMyTestGroup->ytg_comm);
+        MPI_Bcast(ytg->ytg_suffix, YAPIO_MKSTEMP_TEMPLATE_LEN, MPI_CHAR, 0,
+                  ytg->ytg_comm);
         MPI_OP_END;
     }
 
+
     strncpy(&yapioTestFileName[path_len - YAPIO_MKSTEMP_TEMPLATE_LEN],
-            yapioMkstempSuffix, YAPIO_MKSTEMP_TEMPLATE_LEN);
+            ytg->ytg_suffix, YAPIO_MKSTEMP_TEMPLATE_LEN);
 
     if (ytg->ytg_file_per_process)
     {
@@ -1229,7 +1246,7 @@ yapio_setup_test_file(const yapio_test_group_t *ytg)
         for (i = 0; i < yapioNumRanks; i++)
             yapioFileDescFpp[i] = -1;
 
-        const int flags = yapioInitFromMdFile ?
+        const int flags = ytg->ytg_restart_from_previous_job ?
             O_RDWR : (O_CREAT | O_EXCL | O_RDWR);
 
         int rc = yapio_open_fpp_file(yapio_relative_rank_get(ytg, 0), flags);
@@ -1336,7 +1353,7 @@ static int
 yapio_md_buffer_io(const yapio_test_group_t *ytg, const bool dump)
 {
     int rc = snprintf(yapioRestartFileName, PATH_MAX, "%s/.%s%s.%d.md",
-                      yapioTestRootDir, yapioFilePrefix, yapioMkstempSuffix,
+                      yapioTestRootDir, ytg->ytg_prefix, ytg->ytg_suffix,
                       yapio_relative_rank_get(ytg, 0));
     if (rc >= PATH_MAX || rc == -1)
     {
@@ -1424,7 +1441,7 @@ yapio_initialize_source_md_buffer_from_file(const yapio_test_group_t *ytg)
 static void
 yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
 {
-    if (yapioInitFromMdFile)
+    if (ytg->ytg_restart_from_previous_job)
         return yapio_initialize_source_md_buffer_from_file(ytg);
 
     int rel_rank = yapio_relative_rank_get(ytg, 0);
@@ -1646,7 +1663,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
     }
 
 //    if (!rc && !ytc->ytc_no_fsync)
-    if (!ytc->ytc_no_fsync)
+    if (!ytc->ytc_no_fsync && !yapioStoneWalled)
     {
         rc = yapio_fsync();
         if (rc)
@@ -1669,12 +1686,13 @@ yapio_setup_buffers(const yapio_test_group_t *ytg)
 static void
 yapio_unlink_test_file(void)
 {
-    bool fpp = yapioMyTestGroup->ytg_file_per_process;
+    const yapio_test_group_t *ytg = yapioMyTestGroup;
+    bool fpp = ytg->ytg_file_per_process;
 
     const char *unlink_fn = fpp ? yapioTestFileNameFpp : yapioTestFileName;
-    log_msg(YAPIO_LL_DEBUG, "%s keep=%d", unlink_fn, yapioKeepFile);
+    log_msg(YAPIO_LL_DEBUG, "%s keep=%d", unlink_fn, ytg->ytg_keep_file);
 
-    if (yapioKeepFile || (!fpp && !yapio_leader_rank()))
+    if (ytg->ytg_keep_file || (!fpp && !yapio_leader_rank()))
         return;
 
     int rc = YAPIO_SYS_CALL(unlink)(unlink_fn);
@@ -2129,12 +2147,13 @@ yapio_verify_test_contexts(yapio_test_group_t *ytg)
         if (!ytc->ytc_read)
             ytg->ytg_last_writer_ctx = i;
 
-        if (!i && ytc->ytc_read && !yapioInitFromMdFile)
+        if (!i && ytc->ytc_read && !ytg->ytg_restart_from_previous_job)
         {
             if (yapio_leader_rank())
             {
                 log_msg(YAPIO_LL_FATAL,
-                        "If -i is not specified, the first test may not be a read.");
+                        "Read test may not occur first unless restarting from"
+                        " a previous job.");
             }
             else
             {
@@ -2374,7 +2393,8 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
 
     fprintf(stdout, "%8.2f %s.%02d.%02d: %s%s%s%s%s%s%s %6.02f %siB/s%s",
             yapio_timer_to_float(&ytc->ytc_reported_time),
-            ytc->ytc_suffix, ytc->ytc_group->ytg_group_num, ytc->ytc_test_num,
+            ytc->ytc_suffix, ytc->ytc_group->ytg_group_num,
+            ytc->ytc_test_num,
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern ==
               YAPIO_IOP_RANDOM ? "R" : "S")),
@@ -2415,18 +2435,17 @@ yapio_store_md_final_state(void)
 static void
 yapio_try_sync_md(const yapio_test_ctx_t *ytc, const bool last_writer_ctx)
 {
-    if (!ytc->ytc_read && yapioKeepFile)
+    if (!ytc->ytc_read && ytc->ytc_group->ytg_keep_file)
     {
         if (ytc->ytc_stonewalled)
         {
             /* User has requested to keep the output data set but the
              * current write has been stonewalled.
              */
-            yapioKeepFile = 0;
+            ytc->ytc_group->ytg_keep_file = 0;
             log_msg(YAPIO_LL_WARN,
-                    "Stonewalled before write phases could complete.\n"
-                    "Data set %s will be not be kept.",
-                    yapioMkstempSuffix);
+                    "Data set %s%s was stonewalled and will be removed.",
+                    ytc->ytc_group->ytg_prefix, ytc->ytc_group->ytg_suffix);
         }
         else if (last_writer_ctx)
         {
@@ -2443,17 +2462,18 @@ yapio_exec_all_tests(void)
     yapio_mpi_barrier(yapioMyTestGroup->ytg_comm);
 
     log_msg_r0(YAPIO_LL_DEBUG,
-               "g@%p nctxs=%d nranks=%d nblks=%zu blksz=%zu fpp=%d lr=%d",
+               "g@%p nctxs=%d nranks=%d nblks=%zu blksz=%zu fpp=%d lr=%d %s",
                ytg, ytg->ytg_num_contexts, ytg->ytg_num_ranks,
                ytg->ytg_num_blks_per_rank, ytg->ytg_blk_sz,
-               ytg->ytg_file_per_process, ytg->ytg_leader_rank);
+               ytg->ytg_file_per_process, ytg->ytg_leader_rank,
+               ytg->ytg_suffix);
 
     int i;
     for (i = 0; i < yapioMyTestGroup->ytg_num_contexts; i++)
     {
         yapio_test_ctx_t *ytc = &yapioMyTestGroup->ytg_contexts[i];
         ytc->ytc_group = yapioMyTestGroup;
-        strncpy(ytc->ytc_suffix, yapioMkstempSuffix,
+        strncpy(ytc->ytc_suffix, yapioMyTestGroup->ytg_suffix,
                 YAPIO_MKSTEMP_TEMPLATE_LEN);
         /* Setup may require a notable amount of time for buffer exchange and
          * file descriptor operations.
@@ -2625,7 +2645,7 @@ yapio_stats_collection(void *unused_arg)
     }
 
     int remaining_reports = num_remote_test_contexts;
-    while (remaining_reports)
+    while (remaining_reports && !yapioHaltStonewallThread)
     {
         int index, flag;
         MPI_Status status;
