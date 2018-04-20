@@ -35,6 +35,18 @@ run_cmd mpirun -np 1 ./yapio -p "ssf." -s -k -t wsL,rsL ${TEST_DIR}
 run_cmd mpirun -np 1 ./yapio -p "fpp." -s -k -t F:wsL,rsL ${TEST_DIR}
 run_cmd mpirun -np 4 ./yapio -p "fpp-multi." -s -k -t F:wsL,rsL ${TEST_DIR}
 
+run_cmd mpirun -np 8 ./yapio -S1 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -S1 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL -t wsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -S10 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -mm -s -S10 -t n128:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
+
 # Specify num blocks with -n
 run_cmd mpirun -np 4 ./yapio -n 16 -t B1000:wSD,rsL,rRD,rRL,rSD \
     ${TEST_DIR}
@@ -94,6 +106,10 @@ do
 
     MD5SUM=MD5SUM_NEW
 done
+
+run_cmd mpirun -np 4 ./yapio -k -S1 -i ${SUFFIXa} -mm -t \
+    F:N4:B4096:rsL,rRD,rSD ${TEST_DIR}
+
 # Last run (with mmap) and cleanup
 run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} -mm -t F:N4:B4096:rsL,rRD,rSD \
     ${TEST_DIR}
