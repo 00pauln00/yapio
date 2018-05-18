@@ -31,9 +31,21 @@ run_cmd which mpirun
 
 # Launch a few simple tests
 run_cmd mpirun -np 1 ./yapio -t wsL,rsL ${TEST_DIR}
-run_cmd mpirun -np 1 ./yapio -p "ssf." -s -k -t wsL,rsL ${TEST_DIR}
-run_cmd mpirun -np 1 ./yapio -p "fpp." -s -k -t F:wsL,rsL ${TEST_DIR}
-run_cmd mpirun -np 4 ./yapio -p "fpp-multi." -s -k -t F:wsL,rsL ${TEST_DIR}
+run_cmd mpirun -np 1 ./yapio -s -t Pssf.:K:wsL,rsL ${TEST_DIR}
+run_cmd mpirun -np 1 ./yapio -s -t Pfpp.:F:K:wsL,rsL ${TEST_DIR}
+run_cmd mpirun -np 4 ./yapio -s -t Pfpp-multi.:K:F:wsL,rsL ${TEST_DIR}
+
+run_cmd mpirun -np 8 ./yapio -S1 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -S1 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL -t wsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -S10 -t n12800:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
+
+run_cmd mpirun -np 8 ./yapio -mm -s -S10 -t n128:wsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,\
+rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL,rsL,rSD,rRD,rsL,rsL,rsL /tmp/
 
 # Specify num blocks with -n
 run_cmd mpirun -np 4 ./yapio -n 16 -t B1000:wSD,rsL,rRD,rRL,rSD \
@@ -56,11 +68,12 @@ run_cmd mpirun -np 8 ./yapio -t wsL,rsL,wRL,rRD,wRD,rsL,rsD \
     -t F:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
 
 # Launch a compound test with different block sizes
-run_cmd mpirun -np 8 ./yapio -k -t F:N4:B4096:wsL,rsL,wRL,rRD,wRD,rsL,rsD \
-    -t N4:B512:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
+run_cmd mpirun -np 8 ./yapio -t F:K:N4:B4096:wsL,rsL,wRL,rRD,wRD,rsL,rsD \
+    -t K:N4:B512:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
 
 # Prepare to read tests
 let cmd=${CMD_NUM}-1
+
 
 #cat ${TEST_DIR}/log.$cmd
 
@@ -70,11 +83,11 @@ SUFFIXb=`grep -m1 -e [A-Za-z0-9].01.00: ${TEST_DIR}/log.$cmd |  awk '{print $2}'
 run_cmd stat ${TEST_DIR}/.yapio.${SUFFIXa}.0.md
 run_cmd stat ${TEST_DIR}/.yapio.${SUFFIXb}.0.md
 
-run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} \
-    -k -t F:N4:B4096:rsL,wsL,rsL ${TEST_DIR}
+run_cmd mpirun -np 4 ./yapio \
+    -t K:X${SUFFIXa}:F:N4:B4096:rsL,wsL,rsL ${TEST_DIR}
 
-run_cmd mpirun -np 4 ./yapio -i ${SUFFIXb} \
-    -t N4:B512:rsL,wsL,rsL ${TEST_DIR}
+run_cmd mpirun -np 4 ./yapio  \
+    -t X${SUFFIXb}:N4:B512:rsL,wsL,rsL ${TEST_DIR}
 
 run_cmd md5sum ${TEST_DIR}/.yapio.${SUFFIXa}.0.md
 MD5SUM=`md5sum ${TEST_DIR}/.yapio.${SUFFIXa}.0.md | awk '{print $1}'`
@@ -82,8 +95,8 @@ MD5SUM=`md5sum ${TEST_DIR}/.yapio.${SUFFIXa}.0.md | awk '{print $1}'`
 # Run this one a few more times
 for i in {00..03}
 do
-    run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} \
-        -k -t F:N4:B4096:rsL,wRD ${TEST_DIR}
+    run_cmd mpirun -np 4 ./yapio \
+        -t K:X${SUFFIXa}:F:N4:B4096:rsL,wRD ${TEST_DIR}
 
     MD5SUM_NEW=`md5sum ${TEST_DIR}/.yapio.${SUFFIXa}.0.md | awk '{print $1}'`
     if [ $MD5SUM == $MD5SUM_NEW ]
@@ -94,8 +107,12 @@ do
 
     MD5SUM=MD5SUM_NEW
 done
+
+run_cmd mpirun -np 4 ./yapio -S1 -mm -t \
+    K:X${SUFFIXa}:F:N4:B4096:rsL,rRD,rSD ${TEST_DIR}
+
 # Last run (with mmap) and cleanup
-run_cmd mpirun -np 4 ./yapio -i ${SUFFIXa} -mm -t F:N4:B4096:rsL,rRD,rSD \
+run_cmd mpirun -np 4 ./yapio -mm -t X${SUFFIXa}:F:N4:B4096:rsL,rRD,rSD \
     ${TEST_DIR}
 
 stat ${TEST_DIR}/.yapio.${SUFFIXa}.0.md 2>/dev/null >/dev/null
@@ -111,6 +128,9 @@ then
     echo "Failed to remove md file: ${TEST_DIR}/.yapio.${SUFFIXb}.0.md"
     exit 1;
 fi
+
+run_cmd mpirun -np 8 ./yapio -S1 -t K:B4096:wsL,rsL,wRL,rRD,wRD,rsL,rsD \
+    -t K:B4096:wsL,rsL,wRL,rRD,wRD,rsL,rsD ${TEST_DIR}
 
 #ls -lrt ${TEST_DIR}
 
