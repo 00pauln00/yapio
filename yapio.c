@@ -574,7 +574,7 @@ yapio_print_help(int exit_val)
                 "\t    - Pattern:    sequential (s), random (R), strided (S)\n"
                 "\t    - I/O Op:     read (r), write (w)\n"
                 "\t    - Locality:   local (L), distributed (D)\n"
-                "\t    - Sparse I/O: percentage (P), only do P percent of I/Os\n"
+                "\t    - Sparse I/O: missed percentage (M), only do M percent of I/Os\n"
                 "\t    - Options:    backwards (b), holes (h), no-fsync (f)\n"
                 "\t    - Parameters: block-size (B), blocks-per-rank (n),\n"
                 "\t                  num-ranks (N), file-per-process (F)\n"
@@ -585,7 +585,7 @@ yapio_print_help(int exit_val)
                 "\t      Use file-per-process and keep output files.\n"
                 "\n\t    Example: -t wsL,rRD -t N4:B4096:F:ws,rsb\n"
                 "\t      Run two tests simultaneously\n"
-                "\n\t    Example: -t n10:wRDP.9\n"
+                "\n\t    Example: -t n10:wRDM.9\n"
                 "\t      Run 9 random distributed writes over 10 blocks\n"
                 "\t      (1 hole is created)\n",
                 "\n\t    Example: -t Pmy-test-name:wsL,rRD\n"
@@ -732,14 +732,14 @@ yapio_parse_test_recipe(const char *recipe_str)
             i += yapio_test_recipe_param_to_ull(&recipe_str[i + 1], &tmp);
             ytg->ytg_num_ranks = (int)tmp;
             break;
-        case 'P':
+        case 'M':
             if (recipe_str[i + 1] != '.')
             {
                 printf("Percentage should start by '.'\n");
                 yapio_print_help(YAPIO_EXIT_ERR);
             }
             /* find where percentage stops */
-            int len_pdot = strlen("P.");
+            int len_pdot = strlen("M.");
             i += len_pdot;
             int end = i;
             while (end < recipe_str_len)
@@ -1387,45 +1387,6 @@ yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
                            enum yapio_test_ctx_mdh_in_out, int *);
 
-/* Picks out which IOs will be skipped */
-static void
-select_skipped_ios(yapio_test_ctx_t *ytc)
-{
-    /* number of IO operations by this rank */
-    int num_ops;
-    yapio_blk_md_t *md_in;
-    md_in = yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN, &num_ops);
-
-    printf("numops = %d\n", num_ops);
-
-    /* Number of IO operations to be skipped */
-    int skips_left = ytc->ytc_sparse_io;
-
-    /* for random number generation */
-    srand(time(NULL));
-
-    printf("%d skips left\n", skips_left);
-
-    /* for each IO operation */
-    int j;
-    for (j = 0; j < num_ops; j++)
-    {
-        /* skip randomly or skip all remaining IOs
-         * because there's no room for choosing */
-        if (skips_left &&
-            (skips_left == num_ops - j ||
-            rand() % ((num_ops - j)/skips_left)))
-
-        {
-            md_in[j].ybm_skip_io = 1;
-            skips_left--;
-            printf("choosing %d, skips left = %d\n", j, skips_left);
-        }
-        else
-            md_in[j].ybm_skip_io = 0;
-    }
-}
-
 static bool
 skip_io_or_not(int ops_left, int skips_left)
 {
@@ -1439,6 +1400,22 @@ skip_io_or_not(int ops_left, int skips_left)
         return true;
     else
         return false;
+}
+
+/* select skipped IOs */
+static void
+select_holes(int num_ops, int skips_left, yapio_blk_md_t *md)
+{
+    int i;
+    for (i = 0; i < num_ops; i++)
+    {
+        if (skip_io_or_not(num_ops - i, skips_left))
+        {
+            log_msg(YAPIO_LL_DEBUG, "skip IO # %d\n", i);
+            md[i].ybm_skip_io = 1;
+            skips_left--;
+        }
+    }
 }
 
 static int
@@ -1596,7 +1573,6 @@ static int
 yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
                                    const yapio_blk_md_t *md)
 {
-    /* TODO skip verification for holes */
     if (!md->ybm_not_hole)
     {
         log_msg(YAPIO_LL_DEBUG, "No verification for hole");
@@ -1609,8 +1585,6 @@ yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
     size_t i;
     for (i = 0; i < num_words; i++)
     {
-        //printf("buffer_of_longs[i] = %llx, yapio_get_content_word(md, i) = %llx\n",
-        //       buffer_of_longs[i], yapio_get_content_word(md, i));
         if (buffer_of_longs[i] != yapio_get_content_word(md, i))
         {
             log_msg(YAPIO_LL_ERROR, "blk=%zu word=%zu got=%llx expected=%llx",
@@ -1696,8 +1670,6 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
     const yapio_blk_md_t *md_array =
         yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
                                    &ytc->ytc_num_ops_expected);
-
-    bool *skipped_ios = ytc->ytc_skipped_ios;
 
     int j;
     for (j = 0, ytc->ytc_num_ops_completed_before_stonewall = 0;
@@ -1912,7 +1884,7 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc, int rank)
 
         bool skip_io = skip_io_or_not(num_ops - i, skips_left);
 
-        /* update writer in case of write */
+        /* update writer in case of write (which isn't skipped) */
         if (!ytc->ytc_read && !skip_io)
         {
             log_msg(YAPIO_LL_DEBUG, "update writer rank for op #%d\n", i);
@@ -2012,8 +1984,6 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
     if (!md)
         return -errno;
 
-    select_skipped_ios(ytc);
-
     int rc = 0;
 
     if (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL)
@@ -2025,7 +1995,7 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
         rc = yapio_blk_md_randomize(yapioSourceBlkMd, md,
                                     ytg->ytg_num_blks_per_rank, true);
 
-        /* TODO store holes for local random write case */
+        select_holes(ytg->ytg_num_blks_per_rank, ytc->ytc_sparse_io, md);
     }
 
     return rc;
@@ -2054,8 +2024,6 @@ yapio_test_context_setup_distributed_sequential(yapio_test_ctx_t *ytc)
 
     yapio_blk_md_t *md_recv =
         yapio_test_context_alloc(ytc, YAPIO_TEST_CTX_MDH_IN, nblks_per_rank);
-
-    select_skipped_ios(ytc);
 
     yapio_test_context_sequential_setup_for_rank(ytc, dest_rank);
 
@@ -2104,15 +2072,11 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     if (!md_send)
         return -errno;
 
-    select_skipped_ios(ytc);
-
     const bool strided =
         ytc->ytc_io_pattern == YAPIO_IOP_STRIDED ? true : false;
 
     size_t src_idx;
     const int nblks_div_nranks = nblks_per_rank / nranks;
-
-    bool *skipped_ios = ytc->ytc_skipped_ios;
 
 //XXX open all FDs here for FPP
     int skips_left = ytc->ytc_sparse_io;
@@ -2141,7 +2105,7 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
                 if (skip_io)
                 {
                     log_msg(YAPIO_LL_DEBUG, "skip IO # %d\n", i);
-                    md[i].ybm_skip_io = 1;
+                    md_send[total].ybm_skip_io = 1;
                     skips_left--;
                 }
             }
@@ -2151,6 +2115,8 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     {
         yapio_blk_md_randomize(yapioSourceBlkMd, md_send, nblks_per_rank,
                                true);
+
+        select_holes(ytg->ytg_num_blks_per_rank, ytc->ytc_sparse_io, md_send);
 
         if (!ytc->ytc_read)
         {
