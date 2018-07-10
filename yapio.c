@@ -227,7 +227,9 @@ typedef struct yapio_blk_metadata
 {
     int    ybm_writer_rank;     //rank who has last written this block
     int    ybm_owner_rank_fpp;  //fpp only, file to which contents belong
-    size_t ybm_blk_number;      //number of the block - should not change!
+    size_t ybm_blk_number : 62;      //number of the block - should not change!
+    unsigned int ybm_not_hole : 1;   // block is empty (no data)
+    unsigned int ybm_skip_io :1;     // instruction to do IO or not
 } yapio_blk_md_t;
 
 yapio_blk_md_t  *yapioSourceBlkMd; //metadata which this rank maintains
@@ -287,6 +289,7 @@ typedef struct yapio_test_context
     int                      ytc_barrier_max_rank;
     char                     ytc_suffix[YAPIO_MKSTEMP_TEMPLATE_LEN + 1];
     struct yapio_test_group *ytc_group;
+    unsigned int             ytc_sparse_io;      //number of IOs skipped
 } yapio_test_ctx_t;
 
 #define YAPIO_NUM_TEST_CTXS_MAX 256
@@ -571,6 +574,7 @@ yapio_print_help(int exit_val)
                 "\t    - Pattern:    sequential (s), random (R), strided (S)\n"
                 "\t    - I/O Op:     read (r), write (w)\n"
                 "\t    - Locality:   local (L), distributed (D)\n"
+                "\t    - Sparse I/O: missed percentage (M), only do M percent of I/Os\n"
                 "\t    - Options:    backwards (b), holes (h), no-fsync (f)\n"
                 "\t    - Parameters: block-size (B), blocks-per-rank (n),\n"
                 "\t                  num-ranks (N), file-per-process (F)\n"
@@ -581,6 +585,9 @@ yapio_print_help(int exit_val)
                 "\t      Use file-per-process and keep output files.\n"
                 "\n\t    Example: -t wsL,rRD -t N4:B4096:F:ws,rsb\n"
                 "\t      Run two tests simultaneously\n"
+                "\n\t    Example: -t n10:wRDM.9\n"
+                "\t      Run 9 random distributed writes over 10 blocks\n"
+                "\t      (1 hole is created)\n",
                 "\n\t    Example: -t Pmy-test-name:wsL,rRD\n"
                 "\t      Prefix output files with 'my-test-name'\n"
                 "\n\t    Example: -t Xabc123:rRD,rsL,rSD,wRD\n"
@@ -725,6 +732,36 @@ yapio_parse_test_recipe(const char *recipe_str)
             i += yapio_test_recipe_param_to_ull(&recipe_str[i + 1], &tmp);
             ytg->ytg_num_ranks = (int)tmp;
             break;
+        case 'M':
+            if (recipe_str[i + 1] != '.')
+            {
+                printf("Percentage should start by '.'\n");
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+            /* find where percentage stops */
+            int len_pdot = strlen("M.");
+            i += len_pdot;
+            int end = i;
+            while (end < recipe_str_len)
+            {
+                if (!isdigit(recipe_str[end]))
+                    break;
+                end++;
+            }
+            unsigned long int percent = 0;
+            percent = strtoull(&recipe_str[i], NULL, 10);
+
+            /* count number of skipped IOs */
+            ytc->ytc_sparse_io = percent * ytg->ytg_num_blks_per_rank;
+            while (i < end)
+            {
+                ytc->ytc_sparse_io = ytc->ytc_sparse_io / 10;
+                i++;
+            }
+            printf("skip %d IOs\n", ytc->ytc_sparse_io);
+
+            i = end - 1;
+            break;
         case 'K':
             ytg->ytg_keep_file = true;
             i++;
@@ -733,7 +770,6 @@ yapio_parse_test_recipe(const char *recipe_str)
             ytg->ytg_file_per_process = true;
             i++;
             break;
-
         case 'w': //'w' and 'r' are mutually exclusive
             if (!++rw)
                 ytc->ytc_read = 0;
@@ -1092,6 +1128,7 @@ static void
 yapio_verify_test_directory(void)
 {
     struct stat stb;
+
     int rc = stat(yapioTestRootDir, &stb);
     if (rc)
         rc = errno;
@@ -1164,6 +1201,7 @@ yapio_open_fpp_file(int rank, int oflags)
 
     return rc;
 }
+
 
 /**
  * yapio_setup_test_file - Rank0 will create a temp file and broadcast
@@ -1349,6 +1387,37 @@ yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
                            enum yapio_test_ctx_mdh_in_out, int *);
 
+static bool
+skip_io_or_not(int ops_left, int skips_left)
+{
+    /* for random number generation */
+    srand(time(NULL));
+
+    /* skip randomly or skip all remaining IOs
+     * because there's no room for choosing */
+    if (skips_left &&
+        (skips_left == ops_left || rand() % (ops_left / skips_left)))
+        return true;
+    else
+        return false;
+}
+
+/* select skipped IOs */
+static void
+select_holes(int num_ops, int skips_left, yapio_blk_md_t *md)
+{
+    int i;
+    for (i = 0; i < num_ops; i++)
+    {
+        if (skip_io_or_not(num_ops - i, skips_left))
+        {
+            log_msg(YAPIO_LL_DEBUG, "skip IO # %d\n", i);
+            md[i].ybm_skip_io = 1;
+            skips_left--;
+        }
+    }
+}
+
 static int
 yapio_md_buffer_io(const yapio_test_group_t *ytg, const bool dump)
 {
@@ -1456,6 +1525,8 @@ yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
 
         yapioSourceBlkMd[i].ybm_owner_rank_fpp =
             ytg->ytg_file_per_process ? rel_rank : 0;
+
+        yapioSourceBlkMd[i].ybm_not_hole = 0;
     }
 }
 
@@ -1469,6 +1540,7 @@ yapio_source_md_update_writer_rank(size_t source_md_idx, int new_writer_rank)
     log_msg(YAPIO_LL_TRACE, "%d %zu", new_writer_rank, source_md_idx);
 
     yapioSourceBlkMd[source_md_idx].ybm_writer_rank = new_writer_rank;
+    yapioSourceBlkMd[source_md_idx].ybm_not_hole = 1;
 }
 
 static unsigned long long
@@ -1501,6 +1573,12 @@ static int
 yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
                                    const yapio_blk_md_t *md)
 {
+    if (!md->ybm_not_hole)
+    {
+        log_msg(YAPIO_LL_DEBUG, "No verification for hole");
+        return 0;
+    }
+
     const unsigned long long *buffer_of_longs = (unsigned long long *)buf;
     size_t num_words = buf_len / sizeof(unsigned long long);
 
@@ -1619,6 +1697,12 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
             log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed");
             rc = -ERANGE;
             break;
+        }
+
+        if (md->ybm_skip_io)
+        {
+            log_msg(YAPIO_LL_DEBUG, "skipping IO # %d, offset = %lu", j, off);
+            continue;
         }
 
         ssize_t io_rc, io_bytes = 0;
@@ -1792,15 +1876,30 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc, int rank)
     if (!md)
         log_msg(YAPIO_LL_FATAL, "ytc_ops_md[%d] is NULL", rank);
 
+    int skips_left = ytc->ytc_sparse_io;
     int i;
     for (i = 0; i < num_ops; i++)
     {
         size_t src_idx = ytc->ytc_backwards ? num_ops - i - 1 : i;
 
-        if (!ytc->ytc_read)
+        bool skip_io = skip_io_or_not(num_ops - i, skips_left);
+
+        /* update writer in case of write (which isn't skipped) */
+        if (!ytc->ytc_read && !skip_io)
+        {
+            log_msg(YAPIO_LL_DEBUG, "update writer rank for op #%d\n", i);
             yapio_source_md_update_writer_rank(src_idx, rank);
+        }
 
         md[i] = yapioSourceBlkMd[src_idx];
+
+        if (skip_io)
+        {
+            log_msg(YAPIO_LL_DEBUG, "skip IO # %d\n", i);
+            md[i].ybm_skip_io = 1;
+            skips_left--;
+        }
+
         log_msg(YAPIO_LL_TRACE, "writer_rank=%d md->ybm_blk_number=%zd",
                 md[i].ybm_writer_rank, md[i].ybm_blk_number);
     }
@@ -1840,7 +1939,7 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
         md_out[swap_idx] = md_out[i];
         md_out[i] = md_tmp;
 
-        log_msg(YAPIO_LL_TRACE, "swapped %zu:%zu <-> %zu:%zu",
+        log_msg(YAPIO_LL_DEBUG, "swapped %zu:%zu <-> %zu:%zu",
                 i, md_out[swap_idx].ybm_blk_number, swap_idx,
                 md_out[i].ybm_blk_number);
     }
@@ -1892,8 +1991,12 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
                                                      ytg->ytg_first_rank);
 
     else if (ytc->ytc_io_pattern == YAPIO_IOP_RANDOM)
+    {
         rc = yapio_blk_md_randomize(yapioSourceBlkMd, md,
                                     ytg->ytg_num_blks_per_rank, true);
+
+        select_holes(ytg->ytg_num_blks_per_rank, ytc->ytc_sparse_io, md);
+    }
 
     return rc;
 }
@@ -1976,10 +2079,13 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
     const int nblks_div_nranks = nblks_per_rank / nranks;
 
 //XXX open all FDs here for FPP
+    int skips_left = ytc->ytc_sparse_io;
     if (strided)
     {
         int i, j, total = 0;
         for (i = 0, total = 0; i < nranks; i++)
+        {
+            int skips_left = ytc->ytc_sparse_io;
             for (j = 0; j < nblks_div_nranks; j++, total++)
             {
                 src_idx = (nranks * j) + i;
@@ -1987,22 +2093,38 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
                 if (ytc->ytc_backwards)
                     src_idx = (nranks * (nblks_div_nranks - j) - 1 + i);
 #endif
+                bool skip_io = skip_io_or_not(nblks_div_nranks - j, skips_left);
 
-                if (!ytc->ytc_read)
+                if (!ytc->ytc_read && skip_io)
+                {
+                    log_msg(YAPIO_LL_DEBUG, "NN update writer rank for op total = %d\n", total);
                     yapio_source_md_update_writer_rank(src_idx, i);
+                }
 
                 md_send[total] = yapioSourceBlkMd[src_idx];
+                if (skip_io)
+                {
+                    log_msg(YAPIO_LL_DEBUG, "skip IO # %d\n", i);
+                    md_send[total].ybm_skip_io = 1;
+                    skips_left--;
+                }
             }
+        }
     }
     else
     {
         yapio_blk_md_randomize(yapioSourceBlkMd, md_send, nblks_per_rank,
                                true);
 
+        select_holes(ytg->ytg_num_blks_per_rank, ytc->ytc_sparse_io, md_send);
+
         if (!ytc->ytc_read)
         {
             for (src_idx = 0; src_idx < nblks_per_rank; src_idx++)
             {
+                if (md_send[src_idx].ybm_skip_io)
+                    continue;
+
                 const int rank = src_idx / nblks_div_nranks;
 
                 log_msg(YAPIO_LL_TRACE,
@@ -2018,6 +2140,7 @@ yapio_test_context_setup_distributed_random_or_strided(yapio_test_ctx_t *ytc)
                 const size_t update_idx =
                     md_send[src_idx].ybm_blk_number % nblks_per_rank;
 
+                log_msg(YAPIO_LL_DEBUG, "update writer rank for op #%d\n", src_idx);
                 yapio_source_md_update_writer_rank(update_idx, rank);
                 md_send[src_idx].ybm_writer_rank = rank;
             }
@@ -2087,6 +2210,7 @@ yapio_prepare_fpp_file_desc(const yapio_test_ctx_t *ytc)
 
    return rc;
 }
+
 
 /**
  * yapio_test_context_setup - Allocates memory buffers for the test according
