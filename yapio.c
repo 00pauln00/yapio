@@ -100,6 +100,7 @@ static int         yapioStoneWallNsecs;
 static bool        yapioStoneWalled = false;
 static bool        yapioUseStoneWalling = false;
 static bool        yapioHaltStonewallThread = false;
+static int         yapioIOErrorCnt;
 
 static pthread_t       yapioStatsCollectionThread;
 static pthread_t       yapioStatsReportingThread;
@@ -385,7 +386,12 @@ yapio_exit(int exit_rc)
     if (yapioMpiInit)
     {
         yapio_mpi_barrier(MPI_COMM_WORLD);
-        MPI_Finalize();
+
+        if (yapioIOErrorCnt)
+            MPI_Abort(MPI_COMM_WORLD, -EIO);
+
+        else
+            MPI_Finalize();
     }
 
     exit(exit_rc);
@@ -1749,10 +1755,12 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
 //    if (!rc && !ytc->ytc_no_fsync)
     if (!ytc->ytc_no_fsync && !yapioStoneWalled)
     {
-        rc = yapio_fsync();
-        if (rc)
+        int fsync_rc = yapio_fsync();
+        if (fsync_rc)
         {
             log_msg(YAPIO_LL_ERROR, "fsync(): %s", strerror(-rc));
+            if (!rc)
+                rc = fsync_rc;
         }
     }
 
@@ -2622,7 +2630,7 @@ yapio_exec_all_tests(void)
         if (yapio_leader_rank())
             yapio_start_timer(&ytc->ytc_test_duration);
 
-        yapio_perform_io(ytc);
+        yapioIOErrorCnt += yapio_perform_io(ytc);
 
         yapio_start_timer(&ytc->ytc_barrier_wait[0]);
         yapio_mpi_barrier(yapioMyTestGroup->ytg_comm);
