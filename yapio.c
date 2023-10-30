@@ -2669,13 +2669,14 @@ yapio_exec_all_tests(void)
 
         if (ytc->ytc_stonewalled)
         {
-            log_msg(YAPIO_LL_DEBUG, "stonewalled, stopping");
+            log_msg(YAPIO_LL_WARN, "stonewalled, stopping");
             break;
         }
     }
 
-    yapioHaltStonewallThread = true;
     yapio_stat_ready();
+
+    yapioHaltStonewallThread = true;
 }
 
 static void
@@ -2704,50 +2705,64 @@ yapio_assign_rank_to_group(void)
                 yapioMyRank);
 }
 
+static int
+yapio_stats_report_iterate(yapio_timer_t start_time)
+{
+    int remaining = 0;
+    int i;
+    for (i = 0; i < yapioNumTestGroups; i++)
+    {
+        yapio_test_group_t *ytg = &yapioTestGroups[i];
+        int j;
+        for (j = 0; j < ytg->ytg_num_contexts; j++)
+        {
+            yapio_test_ctx_t *ytc = &ytg->ytg_contexts[j];
+
+            if (ytc->ytc_run_status == YAPIO_TEST_CTX_RUN_COMPLETE)
+            {
+                ytc->ytc_reported_time = start_time;
+                yapio_end_timer(&ytc->ytc_reported_time);
+
+                ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_STATS_REPORTED;
+
+                yapio_display_result(ytc);
+            }
+
+            if (ytc->ytc_run_status != YAPIO_TEST_CTX_RUN_STATS_REPORTED)
+                remaining++;
+        }
+    }
+
+    return remaining;
+}
+
 static void *
 yapio_stats_reporting(void *unused_arg)
 {
-    int remaining_test_contexts_to_report;
+    int remaining_test_contexts_to_report = 0;
 
     yapio_timer_t start_time;
     yapio_get_time(&start_time);
 
     do
     {
-        remaining_test_contexts_to_report = 0;
-
         pthread_mutex_lock(&yapioThreadMutex);
 
-        int i;
-        for (i = 0; i < yapioNumTestGroups; i++)
-        {
-            yapio_test_group_t *ytg = &yapioTestGroups[i];
-            int j;
-            for (j = 0; j < ytg->ytg_num_contexts; j++)
-            {
-                yapio_test_ctx_t *ytc = &ytg->ytg_contexts[j];
-
-                if (ytc->ytc_run_status == YAPIO_TEST_CTX_RUN_COMPLETE)
-                {
-                    ytc->ytc_reported_time = start_time;
-                    yapio_end_timer(&ytc->ytc_reported_time);
-
-                    ytc->ytc_run_status =
-                        YAPIO_TEST_CTX_RUN_STATS_REPORTED;
-
-                    yapio_display_result(ytc);
-                }
-
-                if (ytc->ytc_run_status != YAPIO_TEST_CTX_RUN_STATS_REPORTED)
-                    remaining_test_contexts_to_report++;
-            }
-        }
+        remaining_test_contexts_to_report =
+            yapio_stats_report_iterate(start_time);
 
         if (remaining_test_contexts_to_report)
             pthread_cond_wait(&yapioThreadCond, &yapioThreadMutex);
 
         pthread_mutex_unlock(&yapioThreadMutex);
     } while (remaining_test_contexts_to_report && !yapioHaltStonewallThread);
+
+    log_msg(YAPIO_LL_DEBUG,
+            "remaining_test_contexts_to_report=%d yapioHaltStonewallThread=%d",
+            remaining_test_contexts_to_report, yapioHaltStonewallThread);
+
+    if (remaining_test_contexts_to_report)
+        yapio_stats_report_iterate(start_time);
 
     return unused_arg;
 }
