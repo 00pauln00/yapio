@@ -8,6 +8,9 @@ ime : yapio.c
 asan :
 	mpicc -g -o yapio yapio.c -Wall -Wextra -fsanitize=address -lpthread
 
+debug : yapio.c
+	mpicc -o yapio yapio.c -Wall -Wextra -O0 -g -ggdb -lpthread
+
 clean :
 	rm -f yapio.o yapio
 
