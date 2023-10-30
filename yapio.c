@@ -593,7 +593,7 @@ yapio_print_help(int exit_val)
                 "\t      Run two tests simultaneously\n"
                 "\n\t    Example: -t n10:wRDM.9\n"
                 "\t      Run 9 random distributed writes over 10 blocks\n"
-                "\t      (1 hole is created)\n",
+                "\t      (1 hole is created)\n"
                 "\n\t    Example: -t Pmy-test-name:wsL,rRD\n"
                 "\t      Prefix output files with 'my-test-name'\n"
                 "\n\t    Example: -t Xabc123:rRD,rsL,rSD,wRD\n"
