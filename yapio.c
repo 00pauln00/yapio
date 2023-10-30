@@ -1133,9 +1133,16 @@ yapio_getopts(int argc, char **argv)
 static void
 yapio_verify_test_directory(void)
 {
-    struct stat stb;
+    int rc = mkdir(yapioTestRootDir, 0740);
+    if (rc == 0)
+        return;
 
-    int rc = stat(yapioTestRootDir, &stb);
+    if (errno != EEXIST)
+        log_msg(YAPIO_LL_FATAL, "mkdir(%s):  %s", yapioTestRootDir,
+                strerror(errno));
+
+    struct stat stb;
+    rc = stat(yapioTestRootDir, &stb);
     if (rc)
         rc = errno;
 
@@ -1143,7 +1150,7 @@ yapio_verify_test_directory(void)
         rc = ENOTDIR;
 
     if (rc)
-        log_msg(YAPIO_LL_FATAL, "%s", strerror(rc));
+        log_msg(YAPIO_LL_FATAL, "%s:  %s", yapioTestRootDir, strerror(rc));
 }
 
 static int
