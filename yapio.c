@@ -2499,15 +2499,15 @@ yapio_send_test_results(yapio_test_ctx_t *ytc)
 }
 
 static void
-yapio_display_result(const yapio_test_ctx_t *ytc)
+yapio_display_result(const yapio_test_ctx_t *ytc, yapio_test_group_t *ytg)
 {
     const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
-    const int nranks = ytc->ytc_group->ytg_num_ranks;
-    const size_t blksz = ytc->ytc_group->ytg_blk_sz;
+    const int nranks = ytg->ytg_num_ranks;
+    const size_t blksz = ytg->ytg_blk_sz;
     const size_t nblks_per_rank =
         ytc->ytc_stonewalled ?
         (size_t)ytc->ytc_num_ops_completed_before_stonewall :
-        ytc->ytc_group->ytg_num_blks_per_rank;
+        ytg->ytg_num_blks_per_rank;
 
     float bandwidth =
         (float)(((float)nranks * nblks_per_rank * blksz) /
@@ -2537,7 +2537,7 @@ yapio_display_result(const yapio_test_ctx_t *ytc)
 
     fprintf(stdout, "%8.2f %s.%02d.%02d: %s%s%s%s%s%s%s %6.02f %siB/s%s",
             yapio_timer_to_float(&ytc->ytc_reported_time),
-            ytc->ytc_suffix, ytc->ytc_group->ytg_group_num,
+            ytc->ytc_suffix, ytg->ytg_group_num,
             ytc->ytc_test_num,
             (ytc->ytc_io_pattern == YAPIO_IOP_SEQUENTIAL ? "s" :
              (ytc->ytc_io_pattern ==
@@ -2725,7 +2725,7 @@ yapio_stats_report_iterate(yapio_timer_t start_time)
 
                 ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_STATS_REPORTED;
 
-                yapio_display_result(ytc);
+                yapio_display_result(ytc, ytg);
             }
 
             if (ytc->ytc_run_status != YAPIO_TEST_CTX_RUN_STATS_REPORTED)
