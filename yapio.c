@@ -44,7 +44,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:i:m:t:PD:sN:S:v:C:"
+#define YAPIO_OPTS "b:n:hd:i:m:t:PD:sN:S:v:C:z:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -131,6 +131,8 @@ static enum yapio_io_modes yapioModeCurrent = YAPIO_IO_MODE_DEFAULT;
 #include <niova/nclient_private.h>
 #include <niova/common.h>
 
+#include <niova/niova_block_common.h>
+
 /* Required by niova log.h static-inline helpers (regFileEntry, logEntryFileInfo). */
 REGISTRY_ENTRY_FILE_GENERATE;
 
@@ -146,6 +148,13 @@ static char   yapioNiovaConnectStr[256] = {0};
  */
 static niova_block_client_t *yapioNiovaClient  = NULL;
 static uuid_t                yapioNiovaVdevUuid;
+
+/* Total vdev size in bytes.  When non-zero, random IO picks start_vblk from
+ * [0, yapioNiovaVdevSizeBytes/4096) — matching niova-block-test behaviour
+ * where -N (nops) and the address range are independent.
+ * Set via -z <bytes>.  0 means fall back to n*blk_sz (legacy behaviour).
+ */
+static size_t yapioNiovaVdevSizeBytes = 0;
 #endif /* YAPIO_NIOVA */
 
 typedef int     (*openf)(const char *, int, mode_t);
@@ -448,6 +457,7 @@ static void
 yapio_niova_io_cb(void *arg, ssize_t rc)
 {
     yapio_niova_sync_io_t *s = (yapio_niova_sync_io_t *)arg;
+    log_msg(YAPIO_LL_DEBUG, "io_cb rc=%zd", rc);
     pthread_mutex_lock(&s->ynsi_mutex);
     s->ynsi_result = rc;
     s->ynsi_done   = true;
@@ -455,13 +465,38 @@ yapio_niova_io_cb(void *arg, ssize_t rc)
     pthread_mutex_unlock(&s->ynsi_mutex);
 }
 
+/* Build one iovec per 4 KiB vblk, mirroring niova-block-test's ucr_iovs layout.
+ * NiovaBlockClientReadv/Writev expect niovs iovecs each of YAPIO_NIOVA_BLOCK_SIZE. */
+static int
+yapio_niova_build_iovs(struct iovec *iovs, size_t nblks,
+                       void *buf, bool write_op)
+{
+    char *p = (char *)buf;
+    for (size_t i = 0; i < nblks; i++, p += YAPIO_NIOVA_BLOCK_SIZE)
+    {
+        iovs[i].iov_base = write_op ? (void *)p : p;
+        iovs[i].iov_len  = YAPIO_NIOVA_BLOCK_SIZE;
+    }
+    return 0;
+}
+
 static ssize_t
 yapio_niova_sync_read(niova_block_client_t *client, void *buf,
                       size_t count, off_t offset)
 {
-    vdev_vblk_t start_blk = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      nblks     = count  / YAPIO_NIOVA_BLOCK_SIZE;
-    struct iovec iov      = { .iov_base = buf, .iov_len = count };
+    vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
+    size_t      nblks         = count  / YAPIO_NIOVA_BLOCK_SIZE;
+    uint64_t    chunk_num     = start_blk >> VBLK_BITS;
+    uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
+
+    log_msg(YAPIO_LL_DEBUG,
+            "READ  rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
+            "start-vblk=%lu offset=%ld",
+            yapioMyRank, chunk_num, vblk_in_chunk, nblks,
+            (uint64_t)start_blk, offset);
+
+    struct iovec iovs[nblks];
+    yapio_niova_build_iovs(iovs, nblks, buf, false);
 
     yapio_niova_sync_io_t s = {
         .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
@@ -470,7 +505,7 @@ yapio_niova_sync_read(niova_block_client_t *client, void *buf,
         .ynsi_done   = false,
     };
 
-    int rc = NiovaBlockClientReadv(client, start_blk, &iov, nblks,
+    int rc = NiovaBlockClientReadv(client, start_blk, iovs, nblks,
                                    yapio_niova_io_cb, &s);
     if (rc < 0)
         return (ssize_t)rc;
@@ -487,9 +522,19 @@ static ssize_t
 yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
                        size_t count, off_t offset)
 {
-    vdev_vblk_t start_blk = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      nblks     = count  / YAPIO_NIOVA_BLOCK_SIZE;
-    struct iovec iov      = { .iov_base = (void *)buf, .iov_len = count };
+    vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
+    size_t      nblks         = count  / YAPIO_NIOVA_BLOCK_SIZE;
+    uint64_t    chunk_num     = start_blk >> VBLK_BITS;
+    uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
+
+    log_msg(YAPIO_LL_DEBUG,
+            "WRITE rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
+            "start-vblk=%lu offset=%ld",
+            yapioMyRank, chunk_num, vblk_in_chunk, nblks,
+            (uint64_t)start_blk, offset);
+
+    struct iovec iovs[nblks];
+    yapio_niova_build_iovs(iovs, nblks, (void *)buf, true);
 
     yapio_niova_sync_io_t s = {
         .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
@@ -498,8 +543,12 @@ yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
         .ynsi_done   = false,
     };
 
-    int rc = NiovaBlockClientWritev(client, start_blk, &iov, nblks,
+    int rc = NiovaBlockClientWritev(client, start_blk, iovs, nblks,
                                     yapio_niova_io_cb, &s);
+
+    log_msg(YAPIO_LL_DEBUG, "NiovaBlockClientWritev submit rc=%d nblks=%zu "
+            "start-vblk=%lu", rc, nblks, (uint64_t)start_blk);
+
     if (rc < 0)
         return (ssize_t)rc;
 
@@ -639,9 +688,23 @@ yapio_niova_setup_clients(void)
     uuid_copy(xopts.npcx_opts.vdev_uuid, yapioNiovaVdevUuid);
     uuid_generate(xopts.npcx_opts.client_uuid);
 
+    /* For CP mode vdi_num_vblks must be 0 — the library overwrites it with the
+     * value returned by the control plane (mirrors niova-block-test behaviour).
+     * For CLIENT_TEST mode, pre-calculate from -z or n*blk_sz.
+     */
+    size_t vdi_num_vblks = 0;
+    if (!cp_mode)
+    {
+        size_t io_range_bytes = yapioNiovaVdevSizeBytes > 0
+                                ? yapioNiovaVdevSizeBytes
+                                : MAX(yapioNumBlksPerRank * yapioBlkSz,
+                                      YAPIO_NIOVA_DEFAULT_FILE_SIZE);
+        vdi_num_vblks = io_range_bytes / YAPIO_NIOVA_BLOCK_SIZE;
+    }
+
     struct vdev_info vdi = {
         .vdi_mode      = vdi_mode,
-        .vdi_num_vblks = YAPIO_NIOVA_DEFAULT_FILE_SIZE / YAPIO_NIOVA_BLOCK_SIZE,
+        .vdi_num_vblks = vdi_num_vblks,
     };
 
     rc = niova_block_client_set_private_opts(&xopts, &vdi, NULL, NULL);
@@ -654,17 +717,73 @@ yapio_niova_setup_clients(void)
     }
 
     rc = NiovaBlockClientNew(&yapioNiovaClient, &xopts.npcx_opts);
-    if (rc)
+    if (rc || !yapioNiovaClient)
     {
         log_msg(YAPIO_LL_FATAL,
-                "rank %d: NiovaBlockClientNew(): %s",
-                yapioMyRank, strerror(-rc));
+                "rank %d: NiovaBlockClientNew(): rc=%s client=%p",
+                yapioMyRank, strerror(-rc), yapioNiovaClient);
         yapio_exit(YAPIO_EXIT_ERR);
     }
 
-    /* Force 4K block size across all test groups for niova mode. */
+    /* In CP mode adopt the vdev size from the control plane unless -z
+     * was explicitly given. Mirrors: ut2Opts.iopmo_file_size =
+     * niova_block_client_vdev_size(client) in niova-block-test.c.
+     */
+    if (cp_mode && yapioNiovaVdevSizeBytes == 0)
+    {
+        ssize_t cp_sz = niova_block_client_vdev_size(yapioNiovaClient);
+        if (cp_sz > 0)
+            yapioNiovaVdevSizeBytes = (size_t)cp_sz;
+    }
+
+    /* Print vdev info obtained from the control plane after connect. */
+    {
+        char vdev_uuid_str[UUID_STR_LEN];
+        uuid_unparse_lower(yapioNiovaVdevUuid, vdev_uuid_str);
+
+        ssize_t vdev_sz = niova_block_client_vdev_size(yapioNiovaClient);
+        int     max_xfer = niova_block_client_max_xfer_vblks(yapioNiovaClient);
+
+        uint64_t total_vblks   = (vdev_sz > 0) ?
+                                  (uint64_t)vdev_sz / YAPIO_NIOVA_BLOCK_SIZE : 0;
+        uint64_t total_chunks  = total_vblks >> VBLK_BITS;
+
+        fprintf(stderr,
+                "[rank %d] niova vdev connected:\n"
+                "  vdev-uuid    : %s\n"
+                "  connect      : %s\n"
+                "  vdev-size    : %zd bytes (%.2f GiB)\n"
+                "  total-vblks  : %lu  (%lu per chunk)\n"
+                "  total-chunks : %lu  (chunk-size %u GiB)\n"
+                "  max-xfer     : %d vblks (%d bytes)\n",
+                yapioMyRank,
+                vdev_uuid_str,
+                yapioNiovaConnectStr,
+                vdev_sz, (double)vdev_sz / (1ULL << 30),
+                total_vblks, (uint64_t)VBLKS_PER_CHUNK,
+                total_chunks, (unsigned)(VDEV_CHUNK_SIZE_BYTES >> 30),
+                max_xfer, max_xfer * YAPIO_NIOVA_BLOCK_SIZE);
+
+        if (!cp_mode && xopts.npcx_opts.net_target_addr[0])
+            fprintf(stderr,
+                    "  target-addr  : %s:%u\n",
+                    xopts.npcx_opts.net_target_addr,
+                    xopts.npcx_opts.net_target_port);
+    }
+
+    /* Validate that the user's -b block size is a multiple of the niova
+     * 4K vblk size.  Do not override it — the user controls IO size via -b.
+     */
     for (int i = 0; i < yapioNumTestGroups; i++)
-        yapioTestGroups[i].ytg_blk_sz = YAPIO_NIOVA_BLOCK_SIZE;
+    {
+        if (yapioTestGroups[i].ytg_blk_sz % YAPIO_NIOVA_BLOCK_SIZE != 0)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "niova mode: block size %zu must be a multiple of %d",
+                    yapioTestGroups[i].ytg_blk_sz, YAPIO_NIOVA_BLOCK_SIZE);
+            yapio_exit(YAPIO_EXIT_ERR);
+        }
+    }
 }
 
 static void
@@ -1378,6 +1497,9 @@ yapio_getopts(int argc, char **argv)
             strncpy(yapioNiovaConnectStr, optarg,
                     sizeof(yapioNiovaConnectStr) - 1);
             break;
+        case 'z':
+            yapioNiovaVdevSizeBytes = strtoull(optarg, NULL, 10);
+            break;
 #endif
         default:
             yapio_print_help(YAPIO_EXIT_ERR);
@@ -1841,8 +1963,32 @@ yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
     {
         yapioSourceBlkMd[i].ybm_writer_rank = yapioMyRank;
 
-        yapioSourceBlkMd[i].ybm_blk_number = ytg->ytg_file_per_process ? i :
-            rel_rank * ytg->ytg_num_blks_per_rank + i;
+        /* In niova mode each rank owns a separate vdev, so block numbers
+         * always start at 0 (same as file-per-process semantics).
+         * In shared-file modes the rank offset is applied so that each rank
+         * writes to a distinct region of the shared file.
+         *
+         * When -z <vdev_size> is specified in niova mode, spread n IOs evenly
+         * across the full vdev (stride = vdev_total_blks / n).  This mirrors
+         * niova-block-test where -N (nops) and the address range are
+         * independent: random IOs pick from [0, max_blk) regardless of -N.
+         */
+        bool fpp = ytg->ytg_file_per_process ||
+                   (yapioModeCurrent == YAPIO_IO_MODE_NIOVA);
+        size_t blk_num = fpp ? i : rel_rank * ytg->ytg_num_blks_per_rank + i;
+
+#ifdef YAPIO_NIOVA
+        if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA &&
+            yapioNiovaVdevSizeBytes > 0 &&
+            ytg->ytg_num_blks_per_rank > 0)
+        {
+            size_t vdev_total_blks = yapioNiovaVdevSizeBytes / ytg->ytg_blk_sz;
+            size_t stride = vdev_total_blks / ytg->ytg_num_blks_per_rank;
+            if (stride < 1) stride = 1;
+            blk_num = i * stride;
+        }
+#endif
+        yapioSourceBlkMd[i].ybm_blk_number = blk_num;
 
         yapioSourceBlkMd[i].ybm_owner_rank_fpp =
             ytg->ytg_file_per_process ? rel_rank : 0;
@@ -1993,6 +2139,13 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
                                    &ytc->ytc_num_ops_expected);
 
+    const int print_interval = ytc->ytc_num_ops_expected > 10
+                               ? ytc->ytc_num_ops_expected / 10 : 1;
+
+    log_msg(YAPIO_LL_WARN, "rank=%d op=%s blk_sz=%zu nops=%d",
+            yapioMyRank, ytc->ytc_read ? "read" : "write",
+            ytg->ytg_blk_sz, ytc->ytc_num_ops_expected);
+
     int j;
     for (j = 0, ytc->ytc_num_ops_completed_before_stonewall = 0;
          j < ytc->ytc_num_ops_expected;
@@ -2014,6 +2167,12 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         /* Obtain this IO's offset from the
          */
         off_t off = yapio_get_rw_offset(md, ytg->ytg_blk_sz);
+
+        if (j % print_interval == 0)
+            log_msg(YAPIO_LL_WARN, "rank=%d %s op=%d/%d off=%lu blk=%lu",
+                    yapioMyRank, ytc->ytc_read ? "read" : "write",
+                    j, ytc->ytc_num_ops_expected,
+                    (unsigned long)off, md->ybm_blk_number);
         if (off < 0)
         {
             log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed");
@@ -3271,9 +3430,7 @@ main(int argc, char *argv[])
 #ifdef YAPIO_NIOVA
     if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
     {
-        /* Must run before yapio_setup_buffers() so ytg_blk_sz is set to
-         * YAPIO_NIOVA_BLOCK_SIZE before the IO buffer is allocated.
-         */
+        /* Connect to niova before allocating IO buffers. */
         yapio_niova_setup_clients();
     }
 #endif

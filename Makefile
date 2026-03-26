@@ -8,32 +8,28 @@ ime : yapio.c
 # ---------------------------------------------------------------------------
 # Niova mode: direct IO to nisd, bypassing ublk, via libniova_block_client.
 #
-# Variable           Default         Description
-# NIOVA_PATH         /usr/local      niova core install prefix
-#                                    (headers at $(NIOVA_PATH)/include/niova/)
-# NIOVA_BLOCK_PATH   /usr/local      niova-block install prefix
-#                                    (headers at $(NIOVA_BLOCK_PATH)/include/niova/,
-#                                     lib    at $(NIOVA_BLOCK_PATH)/lib/)
+# Variable    Default       Description
+# NIOVA_PATH  /usr/local    niova-core + niova-block install prefix
+#                           (both installed together under this prefix)
+#                           headers : $(NIOVA_PATH)/include/niova/
+#                           libs    : $(NIOVA_PATH)/lib/
 #
-# Both default to /usr/local when installed together.  Override if they
-# live at different prefixes:
-#   make niova NIOVA_PATH=/opt/niova NIOVA_BLOCK_PATH=/opt/niova-block
+# Example:
+#   make niova NIOVA_PATH=/home/manisha/niova-cp-bin
 #
 # Library  : libniova_block_client  (client-only, same as niova-trivial-client)
 # CFLAGS   : -DCLIENT_ONLY          (required by libniova_block_client headers)
 # COMBINED : -lcurl -lxml2 -luring -lcjson  (mirrors Makefile.am COMBINED_LIBS)
 # LDFLAGS  : -z noexecstack         (used on all niova binaries in Makefile.am)
 # ---------------------------------------------------------------------------
-NIOVA_PATH       ?= /usr/local
-NIOVA_BLOCK_PATH ?= /usr/local
+NIOVA_PATH ?= /usr/local
 
 NIOVA_CFLAGS  = -DYAPIO_NIOVA -DCLIENT_ONLY \
-                -I$(NIOVA_PATH)/include \
-                -I$(NIOVA_BLOCK_PATH)/include
+                -I$(NIOVA_PATH)/include
 
-NIOVA_LIBS    = -L$(NIOVA_BLOCK_PATH)/lib \
+NIOVA_LIBS    = -L$(NIOVA_PATH)/lib \
                 -lniova_block_client \
-                -Wl,-rpath,$(NIOVA_BLOCK_PATH)/lib
+                -Wl,-rpath,$(NIOVA_PATH)/lib
 
 # Mirrors COMBINED_LIBS in Makefile.am: $(CURL_LIBS) $(XML_LIBS) $(URING_LIBS) $(CJSON_LIBS)
 COMBINED_LIBS = -lcurl -lxml2 -luring -lcjson -luuid
