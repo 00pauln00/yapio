@@ -155,6 +155,12 @@ static uuid_t                yapioNiovaVdevUuid;
  * Set via -z <bytes>.  0 means fall back to n*blk_sz (legacy behaviour).
  */
 static size_t yapioNiovaVdevSizeBytes = 0;
+
+/* Runtime max transfer size in vblks from niova_block_client_max_xfer_vblks(),
+ * set after client connect.  Used to cap nblks per NiovaBlockClientReadv/Writev
+ * call, mirroring niova-block-test's NIOVA_MAX_VBLKS_PER_REQUEST enforcement.
+ */
+static int yapioNiovaMaxXferVblks = 0;
 #endif /* YAPIO_NIOVA */
 
 typedef int     (*openf)(const char *, int, mode_t);
@@ -489,6 +495,17 @@ yapio_niova_sync_read(niova_block_client_t *client, void *buf,
     uint64_t    chunk_num     = start_blk >> VBLK_BITS;
     uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
 
+    /* Cap to the runtime max transfer size, mirroring niova-block-test's
+     * NIOVA_MAX_VBLKS_PER_REQUEST constraint. */
+    if (yapioNiovaMaxXferVblks > 0 && nblks > (size_t)yapioNiovaMaxXferVblks)
+        nblks = (size_t)yapioNiovaMaxXferVblks;
+
+    /* Cap to the remaining vblks in this chunk to satisfy the
+     * (start_vblk + nblks) <= VBLKS_PER_CHUNK invariant. */
+    size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
+    if (nblks > chunk_remaining)
+        nblks = chunk_remaining;
+
     log_msg(YAPIO_LL_DEBUG,
             "READ  rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
             "start-vblk=%lu offset=%ld",
@@ -526,6 +543,17 @@ yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
     size_t      nblks         = count  / YAPIO_NIOVA_BLOCK_SIZE;
     uint64_t    chunk_num     = start_blk >> VBLK_BITS;
     uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
+
+    /* Cap to the runtime max transfer size, mirroring niova-block-test's
+     * NIOVA_MAX_VBLKS_PER_REQUEST constraint. */
+    if (yapioNiovaMaxXferVblks > 0 && nblks > (size_t)yapioNiovaMaxXferVblks)
+        nblks = (size_t)yapioNiovaMaxXferVblks;
+
+    /* Cap to the remaining vblks in this chunk to satisfy the
+     * (start_vblk + nblks) <= VBLKS_PER_CHUNK invariant. */
+    size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
+    if (nblks > chunk_remaining)
+        nblks = chunk_remaining;
 
     log_msg(YAPIO_LL_DEBUG,
             "WRITE rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
@@ -743,6 +771,8 @@ yapio_niova_setup_clients(void)
 
         ssize_t vdev_sz = niova_block_client_vdev_size(yapioNiovaClient);
         int     max_xfer = niova_block_client_max_xfer_vblks(yapioNiovaClient);
+
+        yapioNiovaMaxXferVblks = max_xfer;
 
         uint64_t total_vblks   = (vdev_sz > 0) ?
                                   (uint64_t)vdev_sz / YAPIO_NIOVA_BLOCK_SIZE : 0;
