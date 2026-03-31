@@ -44,7 +44,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:i:m:t:PD:sN:S:v:C:z:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -82,6 +82,7 @@ static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioPolluteBlks    = false;
+static bool        yapioNetOnly        = false;
 static bool        yapioDisplayStats   = false;
 static int         yapioDecomposeCnt   = 0;
 static const char *yapioExecName;
@@ -729,6 +730,10 @@ yapio_niova_setup_clients(void)
                                       YAPIO_NIOVA_DEFAULT_FILE_SIZE);
         vdi_num_vblks = io_range_bytes / YAPIO_NIOVA_BLOCK_SIZE;
     }
+	if (yapioNetOnly)
+	{
+		xopts.npcx_opts.flags |= NIOVA_BLOCK_FLAGS_NET_ONLY;
+	}
 
     struct vdev_info vdi = {
         .vdi_mode      = vdi_mode,
@@ -1000,8 +1005,9 @@ yapio_print_help(int exit_val)
                 "\t    - P (posix (default))\n"
                 "\t    - I (IME native)\n"
                 "\t    - m (mmap)\n"
-                "\t-n  Number of blocks per task\n"
-                "\t-N  Disable read verification\n"
+                "\t-n  Network only test\n"
+                "\t-N  Number of blocks per task\n"
+                "\t-V  Disable read verification\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -1492,11 +1498,14 @@ yapio_getopts(int argc, char **argv)
         case 'm':
             yapioSysCallOps = yapio_parse_io_mode(optarg);
             break;
-        case 'N':
+        case 'V':
             yapioVerifyRead = false;
             break;
-        case 'n':
+        case 'N':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
+            break;
+        case 'n':
+            yapioNetOnly = true;
             break;
         case 'P':
             yapioPolluteBlks = true;
@@ -2172,7 +2181,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
     const int print_interval = ytc->ytc_num_ops_expected > 10
                                ? ytc->ytc_num_ops_expected / 10 : 1;
 
-    log_msg(YAPIO_LL_WARN, "rank=%d op=%s blk_sz=%zu nops=%d",
+    log_msg(YAPIO_LL_DEBUG, "rank=%d op=%s blk_sz=%zu nops=%d",
             yapioMyRank, ytc->ytc_read ? "read" : "write",
             ytg->ytg_blk_sz, ytc->ytc_num_ops_expected);
 
@@ -2199,7 +2208,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         off_t off = yapio_get_rw_offset(md, ytg->ytg_blk_sz);
 
         if (j % print_interval == 0)
-            log_msg(YAPIO_LL_WARN, "rank=%d %s op=%d/%d off=%lu blk=%lu",
+            log_msg(YAPIO_LL_DEBUG, "rank=%d %s op=%d/%d off=%lu blk=%lu",
                     yapioMyRank, ytc->ytc_read ? "read" : "write",
                     j, ytc->ytc_num_ops_expected,
                     (unsigned long)off, md->ybm_blk_number);
