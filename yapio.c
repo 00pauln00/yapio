@@ -44,7 +44,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:W"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -95,7 +95,8 @@ static int         yapioNumRanks;
 static int         yapioFileDesc;
 static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
-static bool        yapioVerifyRead = true;
+static bool        yapioVerifyRead     = true;
+static bool        yapioWordLevelVerify = false;
 static const char *yapioTestFileNamePrefix = "";
 static int         yapioStoneWallNsecs;
 static bool        yapioStoneWalled = false;
@@ -474,47 +475,39 @@ yapio_niova_io_cb(void *arg, ssize_t rc)
 
 /* Build one iovec per 4 KiB vblk, mirroring niova-block-test's ucr_iovs layout.
  * NiovaBlockClientReadv/Writev expect niovs iovecs each of YAPIO_NIOVA_BLOCK_SIZE. */
-static int
-yapio_niova_build_iovs(struct iovec *iovs, size_t nblks,
-                       void *buf, bool write_op)
-{
-    char *p = (char *)buf;
-    for (size_t i = 0; i < nblks; i++, p += YAPIO_NIOVA_BLOCK_SIZE)
-    {
-        iovs[i].iov_base = write_op ? (void *)p : p;
-        iovs[i].iov_len  = YAPIO_NIOVA_BLOCK_SIZE;
-    }
-    return 0;
-}
-
 static ssize_t
 yapio_niova_sync_read(niova_block_client_t *client, void *buf,
                       size_t count, off_t offset)
 {
     vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      nblks         = count  / YAPIO_NIOVA_BLOCK_SIZE;
+    size_t      blk_sz_vblks  = count  / YAPIO_NIOVA_BLOCK_SIZE;
     uint64_t    chunk_num     = start_blk >> VBLK_BITS;
     uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
 
-    /* Cap to the runtime max transfer size, mirroring niova-block-test's
-     * NIOVA_MAX_VBLKS_PER_REQUEST constraint. */
-    if (yapioNiovaMaxXferVblks > 0 && nblks > (size_t)yapioNiovaMaxXferVblks)
-        nblks = (size_t)yapioNiovaMaxXferVblks;
+    /* Fatal if the buffer exceeds the runtime max transfer size. */
+    if (yapioNiovaMaxXferVblks > 0 &&
+        blk_sz_vblks > (size_t)yapioNiovaMaxXferVblks)
+        log_msg(YAPIO_LL_FATAL,
+                "block size %zu vblks exceeds max xfer %d vblks",
+                blk_sz_vblks, yapioNiovaMaxXferVblks);
 
-    /* Cap to the remaining vblks in this chunk to satisfy the
-     * (start_vblk + nblks) <= VBLKS_PER_CHUNK invariant. */
+    /* If the block would cross a chunk boundary, advance start_blk to the
+     * start of the next chunk so the IO stays within one chunk. */
     size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-    if (nblks > chunk_remaining)
-        nblks = chunk_remaining;
+    if (blk_sz_vblks > chunk_remaining)
+    {
+        chunk_num++;
+        start_blk     = chunk_num << VBLK_BITS;
+        vblk_in_chunk = 0;
+    }
 
     log_msg(YAPIO_LL_DEBUG,
-            "READ  rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
+            "READ  rank=%d chunk=%lu vblk-in-chunk=%lu blk_sz_vblks=%zu "
             "start-vblk=%lu offset=%ld",
-            yapioMyRank, chunk_num, vblk_in_chunk, nblks,
+            yapioMyRank, chunk_num, vblk_in_chunk, blk_sz_vblks,
             (uint64_t)start_blk, offset);
 
-    struct iovec iovs[nblks];
-    yapio_niova_build_iovs(iovs, nblks, buf, false);
+    struct iovec iov = { .iov_base = buf, .iov_len = count };
 
     yapio_niova_sync_io_t s = {
         .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
@@ -523,7 +516,7 @@ yapio_niova_sync_read(niova_block_client_t *client, void *buf,
         .ynsi_done   = false,
     };
 
-    int rc = NiovaBlockClientReadv(client, start_blk, iovs, nblks,
+    int rc = NiovaBlockClientReadv(client, start_blk, &iov, 1,
                                    yapio_niova_io_cb, &s);
     if (rc < 0)
         return (ssize_t)rc;
@@ -541,29 +534,34 @@ yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
                        size_t count, off_t offset)
 {
     vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      nblks         = count  / YAPIO_NIOVA_BLOCK_SIZE;
+    size_t      blk_sz_vblks  = count  / YAPIO_NIOVA_BLOCK_SIZE;
     uint64_t    chunk_num     = start_blk >> VBLK_BITS;
     uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
 
-    /* Cap to the runtime max transfer size, mirroring niova-block-test's
-     * NIOVA_MAX_VBLKS_PER_REQUEST constraint. */
-    if (yapioNiovaMaxXferVblks > 0 && nblks > (size_t)yapioNiovaMaxXferVblks)
-        nblks = (size_t)yapioNiovaMaxXferVblks;
+    /* Fatal if the buffer exceeds the runtime max transfer size. */
+    if (yapioNiovaMaxXferVblks > 0 &&
+        blk_sz_vblks > (size_t)yapioNiovaMaxXferVblks)
+        log_msg(YAPIO_LL_FATAL,
+                "block size %zu vblks exceeds max xfer %d vblks",
+                blk_sz_vblks, yapioNiovaMaxXferVblks);
 
-    /* Cap to the remaining vblks in this chunk to satisfy the
-     * (start_vblk + nblks) <= VBLKS_PER_CHUNK invariant. */
+    /* If the block would cross a chunk boundary, advance start_blk to the
+     * start of the next chunk so the IO stays within one chunk. */
     size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-    if (nblks > chunk_remaining)
-        nblks = chunk_remaining;
+    if (blk_sz_vblks > chunk_remaining)
+    {
+        chunk_num++;
+        start_blk     = chunk_num << VBLK_BITS;
+        vblk_in_chunk = 0;
+    }
 
     log_msg(YAPIO_LL_DEBUG,
-            "WRITE rank=%d chunk=%lu vblk-in-chunk=%lu nblks=%zu "
+            "WRITE rank=%d chunk=%lu vblk-in-chunk=%lu blk_sz_vblks=%zu "
             "start-vblk=%lu offset=%ld",
-            yapioMyRank, chunk_num, vblk_in_chunk, nblks,
+            yapioMyRank, chunk_num, vblk_in_chunk, blk_sz_vblks,
             (uint64_t)start_blk, offset);
 
-    struct iovec iovs[nblks];
-    yapio_niova_build_iovs(iovs, nblks, (void *)buf, true);
+    struct iovec iov = { .iov_base = (void *)buf, .iov_len = count };
 
     yapio_niova_sync_io_t s = {
         .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
@@ -572,11 +570,11 @@ yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
         .ynsi_done   = false,
     };
 
-    int rc = NiovaBlockClientWritev(client, start_blk, iovs, nblks,
+    int rc = NiovaBlockClientWritev(client, start_blk, &iov, 1,
                                     yapio_niova_io_cb, &s);
 
-    log_msg(YAPIO_LL_DEBUG, "NiovaBlockClientWritev submit rc=%d nblks=%zu "
-            "start-vblk=%lu", rc, nblks, (uint64_t)start_blk);
+    log_msg(YAPIO_LL_DEBUG, "NiovaBlockClientWritev submit rc=%d "
+            "start-vblk=%lu", rc, (uint64_t)start_blk);
 
     if (rc < 0)
         return (ssize_t)rc;
@@ -1008,6 +1006,7 @@ yapio_print_help(int exit_val)
                 "\t-n  Network only test\n"
                 "\t-N  Number of blocks per task\n"
                 "\t-V  Disable read verification\n"
+                "\t-W  Enable word-level buffer uniqueness (default: fast seed fill)\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -1485,6 +1484,12 @@ yapio_getopts(int argc, char **argv)
         {
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
+            if (yapioBlkSz == 0 || yapioBlkSz % YAPIO_NIOVA_BLOCK_SIZE != 0)
+            {
+                fprintf(stderr, "Block size must be a non-zero multiple of %d.\n",
+                        YAPIO_NIOVA_BLOCK_SIZE);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
             break;
         case 'D':
             yapioDecomposeCnt = MIN(atoi(optarg), YAPIO_DECOMPOSE_MAX);
@@ -1500,6 +1505,9 @@ yapio_getopts(int argc, char **argv)
             break;
         case 'V':
             yapioVerifyRead = false;
+            break;
+        case 'W':
+            yapioWordLevelVerify = true;
             break;
         case 'N':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
@@ -2066,12 +2074,43 @@ yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
     unsigned long long *buffer_of_longs = (unsigned long long *)buf;
     size_t num_words = buf_len / sizeof(unsigned long long);
 
-    size_t i;
-    for (i = 0; i < num_words; i++)
+    if (yapioWordLevelVerify)
     {
-        buffer_of_longs[i] = yapio_get_content_word(md, i);
+        /* Word-level unique fill: each 8-byte word gets a distinct value
+         * derived from block metadata + word offset.  Enables per-word
+         * corruption detection but is slow for large block sizes.
+         */
+        size_t i;
+        for (i = 0; i < num_words; i++)
+        {
+            buffer_of_longs[i] = yapio_get_content_word(md, i);
+            log_msg(YAPIO_LL_TRACE, "%zu:%llx", i, buffer_of_longs[i]);
+        }
+    }
+    else
+    {
+        /* Fast seed fill: compute one value per block from block metadata,
+         * write it to the first word, then use exponential memcpy doubling
+         * to broadcast it across the entire buffer.  O(log N) memcpy calls
+         * let libc's SIMD-optimised memcpy do the heavy lifting.
+         */
+        unsigned long long seed =
+            yapio_get_blk_magic(md->ybm_blk_number) +
+            md->ybm_writer_rank +
+            md->ybm_blk_number +
+            md->ybm_owner_rank_fpp;
 
-        log_msg(YAPIO_LL_TRACE, "%zu:%llx", i, buffer_of_longs[i]);
+        buffer_of_longs[0] = seed;
+        size_t filled = sizeof(unsigned long long);
+        while (filled * 2 <= buf_len)
+        {
+            memcpy(buf + filled, buf, filled);
+            filled *= 2;
+        }
+        if (filled < buf_len)
+            memcpy(buf + filled, buf, buf_len - filled);
+
+        log_msg(YAPIO_LL_TRACE, "blk=%lu seed=%llx", md->ybm_blk_number, seed);
     }
 }
 
@@ -2088,20 +2127,43 @@ yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
     const unsigned long long *buffer_of_longs = (unsigned long long *)buf;
     size_t num_words = buf_len / sizeof(unsigned long long);
 
-    size_t i;
-    for (i = 0; i < num_words; i++)
+    if (yapioWordLevelVerify)
     {
-        if (buffer_of_longs[i] != yapio_get_content_word(md, i))
+        size_t i;
+        for (i = 0; i < num_words; i++)
         {
-            unsigned long x = md->ybm_blk_number;
-
-            log_msg(YAPIO_LL_ERROR, "blk=%lu word=%zu got=%llx expected=%llx",
-                    x, i, buffer_of_longs[i], yapio_get_content_word(md, i));
-
-            return -1;
+            if (buffer_of_longs[i] != yapio_get_content_word(md, i))
+            {
+                log_msg(YAPIO_LL_ERROR,
+                        "blk=%lu word=%zu got=%llx expected=%llx",
+                        md->ybm_blk_number, i, buffer_of_longs[i],
+                        yapio_get_content_word(md, i));
+                return -1;
+            }
+            log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
         }
+    }
+    else
+    {
+        /* Re-derive the seed used at write time and verify every word. */
+        unsigned long long seed =
+            yapio_get_blk_magic(md->ybm_blk_number) +
+            md->ybm_writer_rank +
+            md->ybm_blk_number +
+            md->ybm_owner_rank_fpp;
 
-        log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
+        size_t i;
+        for (i = 0; i < num_words; i++)
+        {
+            if (buffer_of_longs[i] != seed)
+            {
+                log_msg(YAPIO_LL_ERROR,
+                        "blk=%lu word=%zu got=%llx expected=%llx",
+                        md->ybm_blk_number, i, buffer_of_longs[i], seed);
+                return -1;
+            }
+            log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
+        }
     }
 
     return 0;
@@ -2226,46 +2288,53 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         }
 
         ssize_t io_rc, io_bytes = 0;
-        do
-        {
-            char *adjusted_buf = yapioIOBuf + io_bytes;
-            size_t adjusted_io_len = ytg->ytg_blk_sz - io_bytes;
-            off_t adjusted_off = off + io_bytes;
 
 #ifdef YAPIO_NIOVA
-            if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
-            {
-                io_rc = ytc->ytc_read ?
-                    yapio_niova_sync_read(yapioNiovaClient, adjusted_buf,
-                                         adjusted_io_len, adjusted_off) :
-                    yapio_niova_sync_write(yapioNiovaClient, adjusted_buf,
-                                          adjusted_io_len, adjusted_off);
+        if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+        {
+            /* Niova: issue the full block as a single iov in one call. */
+            io_rc = ytc->ytc_read ?
+                yapio_niova_sync_read(yapioNiovaClient, yapioIOBuf,
+                                      ytg->ytg_blk_sz, off) :
+                yapio_niova_sync_write(yapioNiovaClient, yapioIOBuf,
+                                       ytg->ytg_blk_sz, off);
 
-                log_msg(YAPIO_LL_DEBUG, "niova %s rc=%zd off=%lu rank=%d",
-                        ytc->ytc_read ? "read" : "write", io_rc,
-                        adjusted_off, yapioMyRank);
-            }
-            else
+            log_msg(YAPIO_LL_DEBUG, "niova %s rc=%zd off=%lu rank=%d",
+                    ytc->ytc_read ? "read" : "write", io_rc,
+                    (unsigned long)off, yapioMyRank);
+
+            if (io_rc > 0)
+                io_bytes = io_rc;
+        }
+        else
 #endif
+        {
+            /* POSIX: loop to handle short reads/writes. */
+            do
             {
+                char *adjusted_buf    = yapioIOBuf + io_bytes;
+                size_t adjusted_len   = ytg->ytg_blk_sz - io_bytes;
+                off_t  adjusted_off   = off + io_bytes;
+
                 int fd_idx = md->ybm_owner_rank_fpp;
                 int fd = yapio_get_fd(fd_idx);
 
                 io_rc = ytc->ytc_read ?
-                    YAPIO_SYS_CALL(pread)(fd, adjusted_buf, adjusted_io_len,
+                    YAPIO_SYS_CALL(pread)(fd, adjusted_buf, adjusted_len,
                                           adjusted_off) :
-                    YAPIO_SYS_CALL(pwrite)(fd, adjusted_buf, adjusted_io_len,
+                    YAPIO_SYS_CALL(pwrite)(fd, adjusted_buf, adjusted_len,
                                            adjusted_off);
 
                 log_msg(YAPIO_LL_DEBUG, "%s rc=%zd off=%lu@%d fr=%d",
                         ytc->ytc_read ? "pread" : "pwrite", io_rc,
-                        adjusted_off, fd_idx, ytg->ytg_first_rank);
-            }
+                        (unsigned long)adjusted_off, fd_idx,
+                        ytg->ytg_first_rank);
 
-            if (io_rc > 0)
-                io_bytes += io_rc;
+                if (io_rc > 0)
+                    io_bytes += io_rc;
 
-        } while (io_rc > 0 && (size_t)io_bytes < ytg->ytg_blk_sz);
+            } while (io_rc > 0 && (size_t)io_bytes < ytg->ytg_blk_sz);
+        }
 
         if (io_rc < 0)
         {
