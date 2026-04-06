@@ -139,6 +139,7 @@ static enum yapio_io_modes yapioModeCurrent = YAPIO_IO_MODE_DEFAULT;
 REGISTRY_ENTRY_FILE_GENERATE;
 
 #define YAPIO_NIOVA_BLOCK_SIZE 4096
+#define YAPIO_NIOVA_IOV_SIZE   (128 * 1024)
 /* 64 GiB — mirrors NIOVA_DEFAULT_FILE_SIZE from niova_block_common.h */
 #define YAPIO_NIOVA_DEFAULT_FILE_SIZE ((size_t)1 << 36)
 
@@ -473,119 +474,165 @@ yapio_niova_io_cb(void *arg, ssize_t rc)
     pthread_mutex_unlock(&s->ynsi_mutex);
 }
 
-/* Build one iovec per 4 KiB vblk, mirroring niova-block-test's ucr_iovs layout.
- * NiovaBlockClientReadv/Writev expect niovs iovecs each of YAPIO_NIOVA_BLOCK_SIZE. */
+/* Issue a niova IO (read or write) for the full block.
+ *
+ * count >= YAPIO_NIOVA_IOV_SIZE (128 KiB):
+ *   Loop over the buffer in 128 KiB chunks.  Each iteration submits one
+ *   API call with a single 128 KiB iov and waits for its completion before
+ *   moving to the next chunk.
+ *
+ * count < YAPIO_NIOVA_IOV_SIZE:
+ *   Single API call with one 4 KiB iov per vblk covering the whole buffer.
+ */
+static ssize_t
+yapio_niova_sync_io(niova_block_client_t *client, void *buf,
+                    size_t count, off_t offset, bool read_op)
+{
+    ssize_t total = 0;
+
+    if (count >= YAPIO_NIOVA_IOV_SIZE)
+    {
+        /* Case 1: one API call per 128 KiB chunk, submit then wait per chunk. */
+        size_t      remaining = count;
+        char       *p         = (char *)buf;
+        vdev_vblk_t vblk      = offset / YAPIO_NIOVA_BLOCK_SIZE;
+
+        while (remaining > 0)
+        {
+            size_t chunk_bytes = (remaining >= YAPIO_NIOVA_IOV_SIZE)
+                                 ? YAPIO_NIOVA_IOV_SIZE : remaining;
+            size_t chunk_vblks = chunk_bytes / YAPIO_NIOVA_BLOCK_SIZE;
+
+            /* Fatal if this chunk exceeds the runtime max transfer size. */
+            if (yapioNiovaMaxXferVblks > 0 &&
+                chunk_vblks > (size_t)yapioNiovaMaxXferVblks)
+                log_msg(YAPIO_LL_FATAL,
+                        "chunk %zu vblks exceeds max xfer %d vblks",
+                        chunk_vblks, yapioNiovaMaxXferVblks);
+
+            /* Advance to next chunk boundary if this chunk would cross one. */
+            uint64_t chunk_num     = vblk >> VBLK_BITS;
+            uint64_t vblk_in_chunk = vblk & VBLK_MASK;
+            size_t   crem          = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
+            if (chunk_vblks > crem)
+            {
+                chunk_num++;
+                vblk = chunk_num << VBLK_BITS;
+            }
+
+            log_msg(YAPIO_LL_DEBUG, "%s rank=%d vblk=%lu bytes=%zu",
+                    read_op ? "READ" : "WRITE", yapioMyRank,
+                    (uint64_t)vblk, chunk_bytes);
+
+            struct iovec iov = { .iov_base = p, .iov_len = chunk_bytes };
+
+            yapio_niova_sync_io_t s = {
+                .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
+                .ynsi_cond   = PTHREAD_COND_INITIALIZER,
+                .ynsi_result = 0,
+                .ynsi_done   = false,
+            };
+
+            int rc = read_op
+                ? NiovaBlockClientReadv(client, vblk, &iov, 1,
+                                        yapio_niova_io_cb, &s)
+                : NiovaBlockClientWritev(client, vblk, &iov, 1,
+                                         yapio_niova_io_cb, &s);
+
+            if (rc < 0)
+                return (ssize_t)rc;
+
+            pthread_mutex_lock(&s.ynsi_mutex);
+            while (!s.ynsi_done)
+                pthread_cond_wait(&s.ynsi_cond, &s.ynsi_mutex);
+            pthread_mutex_unlock(&s.ynsi_mutex);
+
+            if (s.ynsi_result < 0)
+                return s.ynsi_result;
+
+            total     += s.ynsi_result;
+            p         += chunk_bytes;
+            vblk      += chunk_vblks;
+            remaining -= chunk_bytes;
+        }
+    }
+    else
+    {
+        /* Case 2: count < 128 KiB — single call with one 4 KiB iov per vblk. */
+        vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
+        size_t      niovs         = count  / YAPIO_NIOVA_BLOCK_SIZE;
+        uint64_t    chunk_num     = start_blk >> VBLK_BITS;
+        uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
+
+        if (yapioNiovaMaxXferVblks > 0 && niovs > (size_t)yapioNiovaMaxXferVblks)
+            log_msg(YAPIO_LL_FATAL,
+                    "block size %zu vblks exceeds max xfer %d vblks",
+                    niovs, yapioNiovaMaxXferVblks);
+
+        size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
+        if (niovs > chunk_remaining)
+        {
+            chunk_num++;
+            start_blk = chunk_num << VBLK_BITS;
+        }
+
+        struct iovec iovs[niovs];
+        char *p = (char *)buf;
+        for (size_t i = 0; i < niovs; i++, p += YAPIO_NIOVA_BLOCK_SIZE)
+        {
+            iovs[i].iov_base = p;
+            iovs[i].iov_len  = YAPIO_NIOVA_BLOCK_SIZE;
+        }
+
+        log_msg(YAPIO_LL_DEBUG,
+                "%s rank=%d start_blk=%lu niovs=%zu",
+                read_op ? "READ" : "WRITE", yapioMyRank,
+                (uint64_t)start_blk, niovs);
+
+        yapio_niova_sync_io_t s = {
+            .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
+            .ynsi_cond   = PTHREAD_COND_INITIALIZER,
+            .ynsi_result = 0,
+            .ynsi_done   = false,
+        };
+
+        int rc = read_op
+            ? NiovaBlockClientReadv(client, start_blk, iovs, niovs,
+                                    yapio_niova_io_cb, &s)
+            : NiovaBlockClientWritev(client, start_blk, iovs, niovs,
+                                     yapio_niova_io_cb, &s);
+
+        log_msg(YAPIO_LL_DEBUG, "%s submit rc=%d start_blk=%lu",
+                read_op ? "READ" : "WRITE", rc, (uint64_t)start_blk);
+
+        if (rc < 0)
+            return (ssize_t)rc;
+
+        pthread_mutex_lock(&s.ynsi_mutex);
+        while (!s.ynsi_done)
+            pthread_cond_wait(&s.ynsi_cond, &s.ynsi_mutex);
+        pthread_mutex_unlock(&s.ynsi_mutex);
+
+        total = s.ynsi_result;
+    }
+
+    return total;
+}
+
 static ssize_t
 yapio_niova_sync_read(niova_block_client_t *client, void *buf,
                       size_t count, off_t offset)
 {
-    vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      blk_sz_vblks  = count  / YAPIO_NIOVA_BLOCK_SIZE;
-    uint64_t    chunk_num     = start_blk >> VBLK_BITS;
-    uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
-
-    /* Fatal if the buffer exceeds the runtime max transfer size. */
-    if (yapioNiovaMaxXferVblks > 0 &&
-        blk_sz_vblks > (size_t)yapioNiovaMaxXferVblks)
-        log_msg(YAPIO_LL_FATAL,
-                "block size %zu vblks exceeds max xfer %d vblks",
-                blk_sz_vblks, yapioNiovaMaxXferVblks);
-
-    /* If the block would cross a chunk boundary, advance start_blk to the
-     * start of the next chunk so the IO stays within one chunk. */
-    size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-    if (blk_sz_vblks > chunk_remaining)
-    {
-        chunk_num++;
-        start_blk     = chunk_num << VBLK_BITS;
-        vblk_in_chunk = 0;
-    }
-
-    log_msg(YAPIO_LL_DEBUG,
-            "READ  rank=%d chunk=%lu vblk-in-chunk=%lu blk_sz_vblks=%zu "
-            "start-vblk=%lu offset=%ld",
-            yapioMyRank, chunk_num, vblk_in_chunk, blk_sz_vblks,
-            (uint64_t)start_blk, offset);
-
-    struct iovec iov = { .iov_base = buf, .iov_len = count };
-
-    yapio_niova_sync_io_t s = {
-        .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
-        .ynsi_cond   = PTHREAD_COND_INITIALIZER,
-        .ynsi_result = 0,
-        .ynsi_done   = false,
-    };
-
-    int rc = NiovaBlockClientReadv(client, start_blk, &iov, 1,
-                                   yapio_niova_io_cb, &s);
-    if (rc < 0)
-        return (ssize_t)rc;
-
-    pthread_mutex_lock(&s.ynsi_mutex);
-    while (!s.ynsi_done)
-        pthread_cond_wait(&s.ynsi_cond, &s.ynsi_mutex);
-    pthread_mutex_unlock(&s.ynsi_mutex);
-
-    return s.ynsi_result;
+    return yapio_niova_sync_io(client, buf, count, offset, true);
 }
 
 static ssize_t
 yapio_niova_sync_write(niova_block_client_t *client, const void *buf,
                        size_t count, off_t offset)
 {
-    vdev_vblk_t start_blk     = offset / YAPIO_NIOVA_BLOCK_SIZE;
-    size_t      blk_sz_vblks  = count  / YAPIO_NIOVA_BLOCK_SIZE;
-    uint64_t    chunk_num     = start_blk >> VBLK_BITS;
-    uint64_t    vblk_in_chunk = start_blk & VBLK_MASK;
-
-    /* Fatal if the buffer exceeds the runtime max transfer size. */
-    if (yapioNiovaMaxXferVblks > 0 &&
-        blk_sz_vblks > (size_t)yapioNiovaMaxXferVblks)
-        log_msg(YAPIO_LL_FATAL,
-                "block size %zu vblks exceeds max xfer %d vblks",
-                blk_sz_vblks, yapioNiovaMaxXferVblks);
-
-    /* If the block would cross a chunk boundary, advance start_blk to the
-     * start of the next chunk so the IO stays within one chunk. */
-    size_t chunk_remaining = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-    if (blk_sz_vblks > chunk_remaining)
-    {
-        chunk_num++;
-        start_blk     = chunk_num << VBLK_BITS;
-        vblk_in_chunk = 0;
-    }
-
-    log_msg(YAPIO_LL_DEBUG,
-            "WRITE rank=%d chunk=%lu vblk-in-chunk=%lu blk_sz_vblks=%zu "
-            "start-vblk=%lu offset=%ld",
-            yapioMyRank, chunk_num, vblk_in_chunk, blk_sz_vblks,
-            (uint64_t)start_blk, offset);
-
-    struct iovec iov = { .iov_base = (void *)buf, .iov_len = count };
-
-    yapio_niova_sync_io_t s = {
-        .ynsi_mutex  = PTHREAD_MUTEX_INITIALIZER,
-        .ynsi_cond   = PTHREAD_COND_INITIALIZER,
-        .ynsi_result = 0,
-        .ynsi_done   = false,
-    };
-
-    int rc = NiovaBlockClientWritev(client, start_blk, &iov, 1,
-                                    yapio_niova_io_cb, &s);
-
-    log_msg(YAPIO_LL_DEBUG, "NiovaBlockClientWritev submit rc=%d "
-            "start-vblk=%lu", rc, (uint64_t)start_blk);
-
-    if (rc < 0)
-        return (ssize_t)rc;
-
-    pthread_mutex_lock(&s.ynsi_mutex);
-    while (!s.ynsi_done)
-        pthread_cond_wait(&s.ynsi_cond, &s.ynsi_mutex);
-    pthread_mutex_unlock(&s.ynsi_mutex);
-
-    return s.ynsi_result;
+    return yapio_niova_sync_io(client, (void *)buf, count, offset, false);
 }
+
 
 /* ---------------------------------------------------------------------------
  * Vdev file parser
