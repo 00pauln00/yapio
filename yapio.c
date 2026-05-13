@@ -2773,6 +2773,18 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc, int rank)
             log_msg(YAPIO_LL_DEBUG, "update writer rank for op #%d\n", i);
             yapio_source_md_update_writer_rank(src_idx, rank);
         }
+#ifdef YAPIO_NIOVA
+        /* In niova mode the vdev is persistent; a read run after a prior write
+         * run will find real data at every block.  Mark blocks as not-hole so
+         * yapio_verify_contents_of_io_buffer() actually verifies the content
+         * instead of silently skipping it.
+         */
+        else if (ytc->ytc_read && !skip_io &&
+                 yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+        {
+            yapioSourceBlkMd[src_idx].ybm_not_hole = 1;
+        }
+#endif
 
         md[i] = yapioSourceBlkMd[src_idx];
 
@@ -3158,7 +3170,11 @@ yapio_verify_test_contexts(yapio_test_group_t *ytg)
         if (!ytc->ytc_read)
             ytg->ytg_last_writer_ctx = i;
 
-        if (!i && ytc->ytc_read && !ytg->ytg_restart_from_previous_job)
+        if (!i && ytc->ytc_read && !ytg->ytg_restart_from_previous_job
+#ifdef YAPIO_NIOVA
+            && yapioModeCurrent != YAPIO_IO_MODE_NIOVA
+#endif
+            )
         {
             if (yapio_leader_rank())
             {
