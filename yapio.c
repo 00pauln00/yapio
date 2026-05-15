@@ -140,7 +140,6 @@ static enum yapio_io_modes yapioModeCurrent = YAPIO_IO_MODE_DEFAULT;
 REGISTRY_ENTRY_FILE_GENERATE;
 
 #define YAPIO_NIOVA_BLOCK_SIZE 4096
-#define YAPIO_NIOVA_IOV_SIZE   (128 * 1024)
 /* 64 GiB — mirrors NIOVA_DEFAULT_FILE_SIZE from niova_block_common.h */
 #define YAPIO_NIOVA_DEFAULT_FILE_SIZE ((size_t)1 << 36)
 
@@ -474,12 +473,9 @@ static size_t yapioNiovaQueueDepth = YAPIO_NIOVA_DEF_QUEUE_DEPTH;
 static char  *yapioNiovaSlotBufs   = NULL;
 
 typedef struct yapio_niova_slot {
-    struct iovec              yns_iov;             /* current chunk — lives in slot  */
-    char                     *yns_buf;             /* per-slot buffer (blk_sz bytes) */
-    const yapio_blk_md_t     *yns_md;             /* block metadata (read-only)      */
-    vdev_vblk_t               yns_vblk;           /* start vblk for current chunk    */
-    size_t                    yns_chunk_remaining; /* bytes left in this block        */
-    ssize_t                   yns_block_bytes;     /* accumulated bytes for this block */
+    struct iovec              yns_iov;    /* full-block iov, set once per submission */
+    char                     *yns_buf;   /* per-slot buffer (blk_sz bytes)          */
+    const yapio_blk_md_t     *yns_md;   /* block metadata (read-only)              */
     bool                      yns_running;
     CIRCLEQ_ENTRY(yapio_niova_slot) yns_lentry;
 } yapio_niova_slot_t;
@@ -517,7 +513,6 @@ typedef struct {
 static yapio_niova_queue_state_t yapioQueueState;
 
 /* Forward declarations — these functions are defined later in the file. */
-static void  yapio_niova_completion_cb(void *arg, ssize_t rc);
 static int   yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
                                                  const yapio_blk_md_t *md);
 static off_t yapio_get_rw_offset(const yapio_blk_md_t *md, size_t blk_sz);
@@ -536,51 +531,8 @@ yapio_niova_signal_done(yapio_niova_queue_state_t *state)
     pthread_mutex_unlock(&state->ynqs_done_mutex);
 }
 
-/* Submit the next 128 KiB (or smaller) chunk of a block from an already-running
- * slot.  Called from yapio_niova_completion_cb() when the current chunk of a
- * large block completes but more chunks remain.
- * Returns 0 on success, negative on submit error.
- */
-static int
-yapio_niova_submit_next_chunk(yapio_niova_queue_state_t *state,
-                              yapio_niova_slot_t *slot)
-{
-    size_t   next_chunk = MIN(slot->yns_chunk_remaining, YAPIO_NIOVA_IOV_SIZE);
-    char    *next_base  = (char *)slot->yns_iov.iov_base +
-                          slot->yns_iov.iov_len;
-    size_t   next_vblks = next_chunk / YAPIO_NIOVA_BLOCK_SIZE;
-
-    /* Advance vblk to next chunk boundary if needed */
-    uint64_t chunk_num     = slot->yns_vblk >> VBLK_BITS;
-    uint64_t vblk_in_chunk = slot->yns_vblk & VBLK_MASK;
-    size_t   crem          = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-    if (next_vblks > crem)
-    {
-        chunk_num++;
-        slot->yns_vblk = chunk_num << VBLK_BITS;
-        next_base = slot->yns_buf +
-                    (state->ynqs_blk_sz - slot->yns_chunk_remaining);
-    }
-
-    slot->yns_iov.iov_base = next_base;
-    slot->yns_iov.iov_len  = next_chunk;
-
-    int rc = state->ynqs_is_read
-        ? NiovaBlockClientReadv(yapioNiovaClient, slot->yns_vblk,
-                                &slot->yns_iov, 1,
-                                yapio_niova_completion_cb, slot)
-        : NiovaBlockClientWritev(yapioNiovaClient, slot->yns_vblk,
-                                 &slot->yns_iov, 1,
-                                 yapio_niova_completion_cb, slot);
-
-    log_msg(YAPIO_LL_DEBUG, "niova %s next-chunk vblk=%lu bytes=%zu rc=%d",
-            state->ynqs_is_read ? "READ" : "WRITE",
-            (uint64_t)slot->yns_vblk, next_chunk, rc);
-
-    return rc;
-}
-
 /* Completion callback — runs on the iopm worker thread.
+ * Fires once per block; nclient_co handles chunk boundaries internally.
  * No mutex needed for CIRCLEQ or counter operations.
  */
 static void
@@ -591,34 +543,12 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
 
     if (rc < 0)
     {
-        log_msg(YAPIO_LL_ERROR, "niova %s cb rc=%zd vblk=%lu",
-                state->ynqs_is_read ? "READ" : "WRITE",
-                rc, (uint64_t)slot->yns_vblk);
+        log_msg(YAPIO_LL_ERROR, "niova %s cb rc=%zd",
+                state->ynqs_is_read ? "READ" : "WRITE", rc);
         if (!state->ynqs_error)
             state->ynqs_error = (int)rc;
-        goto block_done;
     }
-
-    size_t chunk_bytes = slot->yns_iov.iov_len;
-    slot->yns_block_bytes     += rc;
-    slot->yns_chunk_remaining -= chunk_bytes;
-    slot->yns_vblk            += chunk_bytes / YAPIO_NIOVA_BLOCK_SIZE;
-
-    if (slot->yns_chunk_remaining > 0)
-    {
-        /* More chunks remain — submit next immediately; slot stays in running. */
-        int src = yapio_niova_submit_next_chunk(state, slot);
-        if (src < 0)
-        {
-            if (!state->ynqs_error)
-                state->ynqs_error = src;
-            goto block_done;
-        }
-        return;
-    }
-
-    /* All chunks for this block are done. */
-    if (state->ynqs_is_read && yapioVerifyRead && !state->ynqs_error)
+    else if (state->ynqs_is_read && yapioVerifyRead && !state->ynqs_error)
     {
         int vrc = yapio_verify_contents_of_io_buffer(slot->yns_buf,
                                                      state->ynqs_blk_sz,
@@ -627,7 +557,6 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
             state->ynqs_error = vrc;
     }
 
-block_done:
     slot->yns_running = false;
     CIRCLEQ_REMOVE(&state->ynqs_running, slot, yns_lentry);
     CIRCLEQ_INSERT_TAIL(&state->ynqs_idle, slot, yns_lentry);
@@ -642,7 +571,6 @@ block_done:
 
     if (state->ynqs_ncompleted >= state->ynqs_target)
         yapio_niova_signal_done(state);
-    /* yapio_niova_queue_work_cb fires on next iopm iteration for new blocks */
 }
 
 /* iopm runtime callback — runs on the iopm worker thread on every iteration.
@@ -714,32 +642,16 @@ yapio_niova_queue_work_cb(void *arg)
         yapio_niova_slot_t *slot = CIRCLEQ_FIRST(&state->ynqs_idle);
         CIRCLEQ_REMOVE(&state->ynqs_idle, slot, yns_lentry);
 
-        slot->yns_md              = md;
-        slot->yns_block_bytes     = 0;
-        slot->yns_chunk_remaining = state->ynqs_blk_sz;
-        slot->yns_vblk            = (vdev_vblk_t)(off / YAPIO_NIOVA_BLOCK_SIZE);
+        slot->yns_md           = md;
+        slot->yns_iov.iov_base = slot->yns_buf;
+        slot->yns_iov.iov_len  = state->ynqs_blk_sz;
+        slot->yns_running      = true;
+
+        vdev_vblk_t vblk = (vdev_vblk_t)(off / YAPIO_NIOVA_BLOCK_SIZE);
 
         if (!state->ynqs_is_read)
             yapio_apply_contents_to_io_buffer(slot->yns_buf,
                                                state->ynqs_blk_sz, md);
-
-        /* First chunk size and chunk-boundary check */
-        size_t first_chunk = MIN(state->ynqs_blk_sz, YAPIO_NIOVA_IOV_SIZE);
-        size_t first_vblks = first_chunk / YAPIO_NIOVA_BLOCK_SIZE;
-        {
-            uint64_t chunk_num     = slot->yns_vblk >> VBLK_BITS;
-            uint64_t vblk_in_chunk = slot->yns_vblk & VBLK_MASK;
-            size_t   crem          = VBLKS_PER_CHUNK - (size_t)vblk_in_chunk;
-            if (first_vblks > crem)
-            {
-                chunk_num++;
-                slot->yns_vblk = chunk_num << VBLK_BITS;
-            }
-        }
-
-        slot->yns_iov.iov_base = slot->yns_buf;
-        slot->yns_iov.iov_len  = first_chunk;
-        slot->yns_running      = true;
 
         CIRCLEQ_INSERT_TAIL(&state->ynqs_running, slot, yns_lentry);
         state->ynqs_ioh_in_progress++;
@@ -747,13 +659,13 @@ yapio_niova_queue_work_cb(void *arg)
         log_msg(YAPIO_LL_DEBUG, "niova %s submit j=%d vblk=%lu bytes=%zu",
                 state->ynqs_is_read ? "READ" : "WRITE",
                 state->ynqs_next_j - 1,
-                (uint64_t)slot->yns_vblk, first_chunk);
+                (uint64_t)vblk, state->ynqs_blk_sz);
 
         int rc = state->ynqs_is_read
-            ? NiovaBlockClientReadv(yapioNiovaClient, slot->yns_vblk,
+            ? NiovaBlockClientReadv(yapioNiovaClient, vblk,
                                     &slot->yns_iov, 1,
                                     yapio_niova_completion_cb, slot)
-            : NiovaBlockClientWritev(yapioNiovaClient, slot->yns_vblk,
+            : NiovaBlockClientWritev(yapioNiovaClient, vblk,
                                      &slot->yns_iov, 1,
                                      yapio_niova_completion_cb, slot);
 
