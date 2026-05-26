@@ -37,8 +37,8 @@
 
 #define YAPIO_FREE(ptr)                             \
     {                                               \
-        free((ptr));                                \
         log_msg(YAPIO_LL_DEBUG, "free: %p", (ptr)); \
+        free((ptr));                                \
     }
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -696,7 +696,7 @@ yapio_parse_test_recipe(const char *recipe_str)
 
     int rc = 0;
     int rw, locality, io_pattern;
-    int test_ctx_idx;
+    int test_ctx_idx = -1;
     size_t tmp;
 
     rw = locality = io_pattern = -1;
@@ -1342,7 +1342,7 @@ yapio_get_fd(int rank)
 static void
 yapio_close_test_file(const yapio_test_group_t *ytg)
 {
-    int rc;
+    int rc = 0;
 
     if (ytg->ytg_file_per_process)
     {
@@ -2513,7 +2513,7 @@ yapio_display_result(const yapio_test_ctx_t *ytc, yapio_test_group_t *ytg)
         (float)(((float)nranks * nblks_per_rank * blksz) /
                 yapio_timer_to_float(test_duration));
 
-    char *unit_str;
+    char *unit_str = NULL;
     if (bandwidth < (1ULL << 20))
     {
         bandwidth /= (1ULL << 10);
