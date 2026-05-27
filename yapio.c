@@ -22,6 +22,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/queue.h>
 #ifdef YAPIO_IME
 #include <im_client_native2.h>
 #endif
@@ -44,7 +45,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:n:hd:i:m:t:PD:sN:S:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -82,6 +83,7 @@ static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioPolluteBlks    = false;
+static bool        yapioNetOnly        = false;
 static bool        yapioDisplayStats   = false;
 static int         yapioDecomposeCnt   = 0;
 static const char *yapioExecName;
@@ -94,7 +96,8 @@ static int         yapioNumRanks;
 static int         yapioFileDesc;
 static int        *yapioFileDescFpp;
 static char       *yapioIOBuf;
-static bool        yapioVerifyRead = true;
+static bool        yapioVerifyRead     = true;
+static bool        yapioWordLevelVerify = false;
 static const char *yapioTestFileNamePrefix = "";
 static int         yapioStoneWallNsecs;
 static bool        yapioStoneWalled = false;
@@ -120,10 +123,48 @@ enum yapio_io_modes
     YAPIO_IO_MODE_IME     = 1,
     YAPIO_IO_MODE_MPIIO   = 2, // Not yet supported
     YAPIO_IO_MODE_MMAP    = 3,
-    YAPIO_IO_MODE_LAST    = 4,
+    YAPIO_IO_MODE_NIOVA   = 4, // Direct niova block client (bypasses ublk)
+    YAPIO_IO_MODE_LAST    = 5,
 };
 
 static enum yapio_io_modes yapioModeCurrent = YAPIO_IO_MODE_DEFAULT;
+
+#ifdef YAPIO_NIOVA
+#include <niova/nclient.h>
+#include <niova/nclient_private.h>
+#include <niova/common.h>
+
+#include <niova/niova_block_common.h>
+
+/* Required by niova log.h static-inline helpers (regFileEntry, logEntryFileInfo). */
+REGISTRY_ENTRY_FILE_GENERATE;
+
+#define YAPIO_NIOVA_BLOCK_SIZE 4096
+/* 64 GiB — mirrors NIOVA_DEFAULT_FILE_SIZE from niova_block_common.h */
+#define YAPIO_NIOVA_DEFAULT_FILE_SIZE ((size_t)1 << 36)
+
+static char  *yapioNiovaVdevFile        = NULL;
+static char   yapioNiovaConnectStr[256] = {0};
+
+/* Per-rank niova state - each MPI rank (process) holds its own client
+ * connected to the vdev assigned to it by line number in the vdev file.
+ */
+static niova_block_client_t *yapioNiovaClient  = NULL;
+static uuid_t                yapioNiovaVdevUuid;
+
+/* Total vdev size in bytes.  When non-zero, random IO picks start_vblk from
+ * [0, yapioNiovaVdevSizeBytes/4096) — matching niova-block-test behaviour
+ * where -N (nops) and the address range are independent.
+ * Set via -z <bytes>.  0 means fall back to n*blk_sz (legacy behaviour).
+ */
+static size_t yapioNiovaVdevSizeBytes = 0;
+
+/* Runtime max transfer size in vblks from niova_block_client_max_xfer_vblks(),
+ * set after client connect.  Used to cap nblks per NiovaBlockClientReadv/Writev
+ * call, mirroring niova-block-test's NIOVA_MAX_VBLKS_PER_REQUEST enforcement.
+ */
+static int yapioNiovaMaxXferVblks = 0;
+#endif /* YAPIO_NIOVA */
 
 typedef int     (*openf)(const char *, int, mode_t);
 typedef int     (*closef)(int);
@@ -199,6 +240,9 @@ const yapio_io_syscall_ops_t yapioIMESysCallOps =
 
 #define YAPIO_SYS_CALL(__sys_call)              \
     yapioSysCallOps->yapio_sys_ ## __sys_call
+
+/* YAPIO_NIOVA function implementations are defined below, after yapio_exit()
+ * and yapioTestGroups are declared (see "Niova IO helpers" section). */
 
 static int
 yapio_mpi_barrier(MPI_Comm comm)
@@ -362,6 +406,11 @@ yapio_leader_rank(void)
         yapio_global_leader_rank();
 }
 
+/* Ensure yapio's log_msg takes precedence over any prior definition
+ * (e.g. niova log.h may define log_msg as LOG_MSG when YAPIO_NIOVA is set). */
+#ifdef log_msg
+#undef log_msg
+#endif
 #define log_msg(lvl, message, ...)                                  \
     {                                                               \
         if (lvl <= yapioDbgLevel)                                   \
@@ -396,6 +445,493 @@ yapio_exit(int exit_rc)
 
     exit(exit_rc);
 }
+
+#ifdef YAPIO_NIOVA
+/* ---------------------------------------------------------------------------
+ * Niova async IO — iopm-callback event loop
+ *
+ * yapio_niova_queue_work_cb() is registered as the iopm runtime callback via
+ * niova_block_client_set_private_opts().  It runs on the iopm worker thread
+ * already present inside the niova client.
+ *
+ * yapio_niova_completion_cb() is the per-IO completion callback passed to
+ * NiovaBlockClientReadv/Writev.  It also fires on the same iopm worker thread.
+ *
+ * Because both functions share the same thread, all queue state (CIRCLEQ,
+ * counters) is accessed without any mutex.  The only cross-thread
+ * synchronisation is a single mutex+condvar used to notify the MPI main
+ * thread when all blocks in a yapio_perform_io() call have completed.
+ *
+ * This mirrors the nbti_queue_work() / nbti_completion_cb() pattern in
+ * niova-block-test.c client mode, adapted for yapio's MPI main-thread model.
+ * -------------------------------------------------------------------------*/
+
+#define YAPIO_NIOVA_DEF_QUEUE_DEPTH   12
+#define YAPIO_NIOVA_MAX_QUEUE_DEPTH  256
+
+static size_t yapioNiovaQueueDepth = YAPIO_NIOVA_DEF_QUEUE_DEPTH;
+static char  *yapioNiovaSlotBufs   = NULL;
+
+typedef struct yapio_niova_slot {
+    struct iovec              yns_iov;    /* full-block iov, set once per submission */
+    char                     *yns_buf;   /* per-slot buffer (blk_sz bytes)          */
+    const yapio_blk_md_t     *yns_md;   /* block metadata (read-only)              */
+    bool                      yns_running;
+    CIRCLEQ_ENTRY(yapio_niova_slot) yns_lentry;
+} yapio_niova_slot_t;
+
+CIRCLEQ_HEAD(yapio_niova_slot_queue, yapio_niova_slot);
+
+typedef struct {
+    /* Slot pool — accessed only on the iopm worker thread, no mutex needed */
+    yapio_niova_slot_t           *ynqs_slots;      /* dynamically allocated          */
+    struct yapio_niova_slot_queue ynqs_idle;
+    struct yapio_niova_slot_queue ynqs_running;
+    int                           ynqs_num_ioh;    /* min(total_blocks, queue_depth) */
+    int                           ynqs_ioh_in_progress;
+
+    /* Work items — set by main thread before iopm starts, read-only after */
+    const yapio_blk_md_t         *ynqs_md_array;
+    int                           ynqs_total_blocks;
+    int                           ynqs_next_j;     /* next md_array index to submit  */
+    int                           ynqs_target;     /* completions needed before done  */
+    size_t                        ynqs_blk_sz;
+    bool                          ynqs_is_read;
+    bool                          ynqs_ready;      /* main thread sets true to start  */
+    yapio_test_ctx_t             *ynqs_ytc;        /* for stonewall + completed count */
+
+    /* Results — written on iopm thread, read by main thread after done */
+    int                           ynqs_ncompleted;
+    int                           ynqs_error;
+
+    /* Main thread notification — the only cross-thread synchronisation */
+    pthread_mutex_t               ynqs_done_mutex;
+    pthread_cond_t                ynqs_done_cond;
+    bool                          ynqs_done;
+} yapio_niova_queue_state_t;
+
+static yapio_niova_queue_state_t yapioQueueState;
+
+/* Forward declarations — these functions are defined later in the file. */
+static int   yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
+                                                 const yapio_blk_md_t *md);
+static off_t yapio_get_rw_offset(const yapio_blk_md_t *md, size_t blk_sz);
+static void  yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
+                                                const yapio_blk_md_t *md);
+
+/* Signal the MPI main thread that all IO for this test context is done.
+ * Called from the iopm worker thread (under no lock).
+ */
+static void
+yapio_niova_signal_done(yapio_niova_queue_state_t *state)
+{
+    pthread_mutex_lock(&state->ynqs_done_mutex);
+    state->ynqs_done = true;
+    pthread_cond_signal(&state->ynqs_done_cond);
+    pthread_mutex_unlock(&state->ynqs_done_mutex);
+}
+
+/* Completion callback — runs on the iopm worker thread.
+ * Fires once per block; nclient_co handles chunk boundaries internally.
+ * No mutex needed for CIRCLEQ or counter operations.
+ */
+static void
+yapio_niova_completion_cb(void *arg, ssize_t rc)
+{
+    yapio_niova_slot_t        *slot  = (yapio_niova_slot_t *)arg;
+    yapio_niova_queue_state_t *state = &yapioQueueState;
+
+    if (rc < 0)
+    {
+        log_msg(YAPIO_LL_ERROR, "niova %s cb rc=%zd",
+                state->ynqs_is_read ? "READ" : "WRITE", rc);
+        if (!state->ynqs_error)
+            state->ynqs_error = (int)rc;
+    }
+    else if (state->ynqs_is_read && yapioVerifyRead && !state->ynqs_error)
+    {
+        int vrc = yapio_verify_contents_of_io_buffer(slot->yns_buf,
+                                                     state->ynqs_blk_sz,
+                                                     slot->yns_md);
+        if (vrc && !state->ynqs_error)
+            state->ynqs_error = vrc;
+    }
+
+    slot->yns_running = false;
+    CIRCLEQ_REMOVE(&state->ynqs_running, slot, yns_lentry);
+    CIRCLEQ_INSERT_TAIL(&state->ynqs_idle, slot, yns_lentry);
+    state->ynqs_ioh_in_progress--;
+    state->ynqs_ncompleted++;
+    state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
+
+    log_msg(YAPIO_LL_DEBUG, "niova %s done %d/%d err=%d",
+            state->ynqs_is_read ? "READ" : "WRITE",
+            state->ynqs_ncompleted, state->ynqs_target,
+            state->ynqs_error);
+
+    if (state->ynqs_ncompleted >= state->ynqs_target)
+        yapio_niova_signal_done(state);
+}
+
+/* iopm runtime callback — runs on the iopm worker thread on every iteration.
+ * Mirrors nbti_queue_work() in niova-block-test.c client mode.
+ * No mutex needed: both this function and yapio_niova_completion_cb run on
+ * the same iopm worker thread.
+ */
+static void
+yapio_niova_queue_work_cb(void *arg)
+{
+    yapio_niova_queue_state_t *state = (yapio_niova_queue_state_t *)arg;
+
+    if (!state->ynqs_ready || state->ynqs_done)
+        return;
+
+    /* Stonewall: stop submitting new blocks.  In-flight ops continue until
+     * their completion callbacks fire.  Update target so the completion
+     * callback knows when all submitted work is done.
+     */
+    if (yapioStoneWalled && !state->ynqs_ytc->ytc_stonewalled)
+    {
+        state->ynqs_ytc->ytc_stonewalled = 1;
+        state->ynqs_target = state->ynqs_next_j;
+        if (state->ynqs_ncompleted >= state->ynqs_target)
+            yapio_niova_signal_done(state);
+        return;
+    }
+
+    if (state->ynqs_ytc->ytc_stonewalled)
+        return;
+
+    int remaining = state->ynqs_next_j < state->ynqs_total_blocks
+                    ? state->ynqs_total_blocks - state->ynqs_next_j : 0;
+    if (remaining == 0)
+        return;
+
+    int to_submit = MIN(remaining,
+                        state->ynqs_num_ioh - state->ynqs_ioh_in_progress);
+
+    for (int i = 0; i < to_submit; i++)
+    {
+        if (CIRCLEQ_EMPTY(&state->ynqs_idle))
+            break;
+
+        const yapio_blk_md_t *md = &state->ynqs_md_array[state->ynqs_next_j];
+        state->ynqs_next_j++;
+
+        /* Skip flagged blocks without consuming a slot */
+        if (md->ybm_skip_io)
+        {
+            state->ynqs_ncompleted++;
+            state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
+            to_submit++; /* allow one more iteration to fill the gap */
+            if (state->ynqs_ncompleted >= state->ynqs_target)
+                yapio_niova_signal_done(state);
+            continue;
+        }
+
+        off_t off = yapio_get_rw_offset(md, state->ynqs_blk_sz);
+        if (off < 0)
+        {
+            log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed j=%d",
+                    state->ynqs_next_j - 1);
+            if (!state->ynqs_error)
+                state->ynqs_error = -ERANGE;
+            break;
+        }
+
+        yapio_niova_slot_t *slot = CIRCLEQ_FIRST(&state->ynqs_idle);
+        CIRCLEQ_REMOVE(&state->ynqs_idle, slot, yns_lentry);
+
+        slot->yns_md           = md;
+        slot->yns_iov.iov_base = slot->yns_buf;
+        slot->yns_iov.iov_len  = state->ynqs_blk_sz;
+        slot->yns_running      = true;
+
+        vdev_vblk_t vblk = (vdev_vblk_t)(off / YAPIO_NIOVA_BLOCK_SIZE);
+
+        if (!state->ynqs_is_read)
+            yapio_apply_contents_to_io_buffer(slot->yns_buf,
+                                               state->ynqs_blk_sz, md);
+
+        CIRCLEQ_INSERT_TAIL(&state->ynqs_running, slot, yns_lentry);
+        state->ynqs_ioh_in_progress++;
+
+        log_msg(YAPIO_LL_DEBUG, "niova %s submit j=%d vblk=%lu bytes=%zu",
+                state->ynqs_is_read ? "READ" : "WRITE",
+                state->ynqs_next_j - 1,
+                (uint64_t)vblk, state->ynqs_blk_sz);
+
+        int rc = state->ynqs_is_read
+            ? NiovaBlockClientReadv(yapioNiovaClient, vblk,
+                                    &slot->yns_iov, 1,
+                                    yapio_niova_completion_cb, slot)
+            : NiovaBlockClientWritev(yapioNiovaClient, vblk,
+                                     &slot->yns_iov, 1,
+                                     yapio_niova_completion_cb, slot);
+
+        if (rc < 0)
+        {
+            log_msg(YAPIO_LL_ERROR, "niova %s submit failed rc=%d j=%d",
+                    state->ynqs_is_read ? "READ" : "WRITE",
+                    rc, state->ynqs_next_j - 1);
+            /* Drive through completion path to keep accounting correct */
+            yapio_niova_completion_cb(slot, (ssize_t)rc);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Vdev file parser
+ *
+ * File format (one entry per non-comment, non-blank line):
+ *   <vdev_uuid>  [connect_string]
+ *
+ * Line number (0-based, skipping comments/blanks) maps to MPI rank.
+ * connect_string (e.g. "unix:<target_uuid>") is optional per line; if
+ * absent, yapioNiovaConnectStr (set via -C) is used as a fallback.
+ * -------------------------------------------------------------------------*/
+static int
+yapio_niova_parse_vdev_file(void)
+{
+    FILE *f = fopen(yapioNiovaVdevFile, "r");
+    if (!f)
+    {
+        log_msg(YAPIO_LL_FATAL, "fopen(%s): %s",
+                yapioNiovaVdevFile, strerror(errno));
+        return -errno;
+    }
+
+    char line[512];
+    int  line_num = 0;
+    int  rc       = -ENOENT;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        /* Skip comment and blank lines without counting them. */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+            continue;
+
+        if (line_num == yapioMyRank)
+        {
+            char vdev_str[UUID_STR_LEN + 1] = {0};
+            char conn_str[256]              = {0};
+
+            int n = sscanf(line, "%36s %255s", vdev_str, conn_str);
+            if (n < 1)
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "rank %d: malformed line %d in %s",
+                        yapioMyRank, line_num, yapioNiovaVdevFile);
+                fclose(f);
+                return -EINVAL;
+            }
+
+            if (uuid_parse(vdev_str, yapioNiovaVdevUuid))
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "rank %d: invalid UUID '%s' on line %d of %s",
+                        yapioMyRank, vdev_str, line_num, yapioNiovaVdevFile);
+                fclose(f);
+                return -EINVAL;
+            }
+
+            /* Per-line connect string overrides the global -C value. */
+            if (n == 2)
+                strncpy(yapioNiovaConnectStr, conn_str,
+                        sizeof(yapioNiovaConnectStr) - 1);
+
+            rc = 0;
+        }
+
+        line_num++;
+    }
+
+    fclose(f);
+
+    if (rc)
+    {
+        log_msg(YAPIO_LL_FATAL,
+                "rank %d: no vdev entry found (file has %d entries, "
+                "need at least %d): %s",
+                yapioMyRank, line_num, yapioNumRanks, yapioNiovaVdevFile);
+        return rc;
+    }
+
+    if (yapio_global_leader_rank() && line_num != yapioNumRanks)
+        log_msg(YAPIO_LL_WARN,
+                "vdev file has %d entries but MPI has %d ranks",
+                line_num, yapioNumRanks);
+
+    return 0;
+}
+
+/* Setup one niova block client per MPI rank, connected to the vdev UUID
+ * assigned to this rank in the vdev file.  Must be called before
+ * yapio_setup_buffers() so that ytg_blk_sz is already set to 4096.
+ */
+static void
+yapio_niova_setup_clients(void)
+{
+    int rc = yapio_niova_parse_vdev_file();
+    if (rc)
+        yapio_exit(YAPIO_EXIT_ERR);
+
+    if (!yapioNiovaConnectStr[0])
+    {
+        log_msg(YAPIO_LL_FATAL,
+                "rank %d: no niova connect string "
+                "(use -C <connect_str> or embed in vdev file)",
+                yapioMyRank);
+        yapio_exit(YAPIO_EXIT_ERR);
+    }
+
+    struct niova_block_client_xopts xopts = {0};
+
+    /* "cp" means control-plane mode; anything else is a transport connect
+     * string (e.g. "unix:<target_uuid>") parsed by the library. */
+    bool cp_mode = (strcmp(yapioNiovaConnectStr, "cp") == 0);
+    int  vdi_mode = cp_mode ? VDEV_MODE_CONTROL_PLANE : VDEV_MODE_CLIENT_TEST;
+
+    if (!cp_mode)
+    {
+        rc = niova_block_client_parse_target_opt_string(yapioNiovaConnectStr,
+                                                        &xopts.npcx_opts);
+        if (rc)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "rank %d: parse_target_opt_string('%s'): %s",
+                    yapioMyRank, yapioNiovaConnectStr, strerror(-rc));
+            yapio_exit(YAPIO_EXIT_ERR);
+        }
+    }
+
+    uuid_copy(xopts.npcx_opts.vdev_uuid, yapioNiovaVdevUuid);
+    uuid_generate(xopts.npcx_opts.client_uuid);
+
+    /* For CP mode vdi_num_vblks must be 0 — the library overwrites it with the
+     * value returned by the control plane (mirrors niova-block-test behaviour).
+     * For CLIENT_TEST mode, pre-calculate from -z or n*blk_sz.
+     */
+    size_t vdi_num_vblks = 0;
+    if (!cp_mode)
+    {
+        size_t io_range_bytes = yapioNiovaVdevSizeBytes > 0
+                                ? yapioNiovaVdevSizeBytes
+                                : MAX(yapioNumBlksPerRank * yapioBlkSz,
+                                      YAPIO_NIOVA_DEFAULT_FILE_SIZE);
+        vdi_num_vblks = io_range_bytes / YAPIO_NIOVA_BLOCK_SIZE;
+    }
+	if (yapioNetOnly)
+	{
+		xopts.npcx_opts.flags |= NIOVA_BLOCK_FLAGS_NET_ONLY;
+	}
+
+    struct vdev_info vdi = {
+        .vdi_mode      = vdi_mode,
+        .vdi_num_vblks = vdi_num_vblks,
+    };
+
+    /* Register yapio_niova_queue_work_cb as the iopm runtime callback so it
+     * runs on the same iopm worker thread as completion callbacks, eliminating
+     * the need for any mutex on the hot IO submission/completion path.
+     * Mirrors: niova_block_client_set_private_opts(..., ut2_client_runtime_cb, nbti)
+     * in niova-block-test.c client mode.
+     */
+    rc = niova_block_client_set_private_opts(&xopts, &vdi,
+                                              yapio_niova_queue_work_cb,
+                                              &yapioQueueState);
+    if (rc)
+    {
+        log_msg(YAPIO_LL_FATAL,
+                "rank %d: niova_block_client_set_private_opts(): %s",
+                yapioMyRank, strerror(-rc));
+        yapio_exit(YAPIO_EXIT_ERR);
+    }
+
+    xopts.npcx_opts.queue_depth = (unsigned int)yapioNiovaQueueDepth;
+
+    rc = NiovaBlockClientNew(&yapioNiovaClient, &xopts.npcx_opts);
+    if (rc || !yapioNiovaClient)
+    {
+        log_msg(YAPIO_LL_FATAL,
+                "rank %d: NiovaBlockClientNew(): rc=%s client=%p",
+                yapioMyRank, strerror(-rc), yapioNiovaClient);
+        yapio_exit(YAPIO_EXIT_ERR);
+    }
+
+    /* In CP mode adopt the vdev size from the control plane unless -z
+     * was explicitly given. Mirrors: ut2Opts.iopmo_file_size =
+     * niova_block_client_vdev_size(client) in niova-block-test.c.
+     */
+    if (cp_mode && yapioNiovaVdevSizeBytes == 0)
+    {
+        ssize_t cp_sz = niova_block_client_vdev_size(yapioNiovaClient);
+        if (cp_sz > 0)
+            yapioNiovaVdevSizeBytes = (size_t)cp_sz;
+    }
+
+    /* Print vdev info obtained from the control plane after connect. */
+    {
+        char vdev_uuid_str[UUID_STR_LEN];
+        uuid_unparse_lower(yapioNiovaVdevUuid, vdev_uuid_str);
+
+        ssize_t vdev_sz = niova_block_client_vdev_size(yapioNiovaClient);
+        int     max_xfer = niova_block_client_max_xfer_vblks(yapioNiovaClient);
+
+        yapioNiovaMaxXferVblks = max_xfer;
+
+        uint64_t total_vblks   = (vdev_sz > 0) ?
+                                  (uint64_t)vdev_sz / YAPIO_NIOVA_BLOCK_SIZE : 0;
+        uint64_t total_chunks  = total_vblks >> VBLK_BITS;
+
+        fprintf(stderr,
+                "[rank %d] niova vdev connected:\n"
+                "  vdev-uuid    : %s\n"
+                "  connect      : %s\n"
+                "  vdev-size    : %zd bytes (%.2f GiB)\n"
+                "  total-vblks  : %lu  (%lu per chunk)\n"
+                "  total-chunks : %lu  (chunk-size %u GiB)\n"
+                "  max-xfer     : %d vblks (%d bytes)\n",
+                yapioMyRank,
+                vdev_uuid_str,
+                yapioNiovaConnectStr,
+                vdev_sz, (double)vdev_sz / (1ULL << 30),
+                total_vblks, (uint64_t)VBLKS_PER_CHUNK,
+                total_chunks, (unsigned)(VDEV_CHUNK_SIZE_BYTES >> 30),
+                max_xfer, max_xfer * YAPIO_NIOVA_BLOCK_SIZE);
+
+        if (!cp_mode && xopts.npcx_opts.net_target_addr[0])
+            fprintf(stderr,
+                    "  target-addr  : %s:%u\n",
+                    xopts.npcx_opts.net_target_addr,
+                    xopts.npcx_opts.net_target_port);
+    }
+
+    /* Validate that the user's -b block size is a multiple of the niova
+     * 4K vblk size.  Do not override it — the user controls IO size via -b.
+     */
+    for (int i = 0; i < yapioNumTestGroups; i++)
+    {
+        if (yapioTestGroups[i].ytg_blk_sz % YAPIO_NIOVA_BLOCK_SIZE != 0)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "niova mode: block size %zu must be a multiple of %d",
+                    yapioTestGroups[i].ytg_blk_sz, YAPIO_NIOVA_BLOCK_SIZE);
+            yapio_exit(YAPIO_EXIT_ERR);
+        }
+    }
+}
+
+static void
+yapio_niova_teardown_clients(void)
+{
+    if (yapioNiovaClient)
+    {
+        NiovaBlockClientDestroy(yapioNiovaClient);
+        yapioNiovaClient = NULL;
+    }
+}
+#endif /* YAPIO_NIOVA */
 
 static int
 yapio_mmap_open(const char *file, int flags, mode_t mode)
@@ -570,8 +1106,11 @@ yapio_print_help(int exit_val)
                 "\t    - P (posix (default))\n"
                 "\t    - I (IME native)\n"
                 "\t    - m (mmap)\n"
-                "\t-n  Number of blocks per task\n"
-                "\t-N  Disable read verification\n"
+                "\t-n  Network only test\n"
+                "\t-N  Number of blocks per task\n"
+                "\t-V  Disable read verification\n"
+                "\t-W  Enable word-level buffer uniqueness (default: fast seed fill)\n"
+                "\t-q  Niova queue depth (default 12, max 256, niova mode only)\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -1023,6 +1562,12 @@ yapio_parse_io_mode(const char *io_mode_str)
         yapioModeCurrent = YAPIO_IO_MODE_MMAP;
         return yapio_io_modes[YAPIO_IO_MODE_MMAP];
 
+#ifdef YAPIO_NIOVA
+    case 'N':
+        yapioModeCurrent = YAPIO_IO_MODE_NIOVA;
+        return NULL; // niova does not use the syscall ops table
+#endif
+
     default:
         return NULL;
     }
@@ -1043,6 +1588,12 @@ yapio_getopts(int argc, char **argv)
         {
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
+            if (yapioBlkSz == 0 || yapioBlkSz % YAPIO_NIOVA_BLOCK_SIZE != 0)
+            {
+                fprintf(stderr, "Block size must be a non-zero multiple of %d.\n",
+                        YAPIO_NIOVA_BLOCK_SIZE);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
             break;
         case 'D':
             yapioDecomposeCnt = MIN(atoi(optarg), YAPIO_DECOMPOSE_MAX);
@@ -1056,11 +1607,17 @@ yapio_getopts(int argc, char **argv)
         case 'm':
             yapioSysCallOps = yapio_parse_io_mode(optarg);
             break;
-        case 'N':
+        case 'V':
             yapioVerifyRead = false;
             break;
-        case 'n':
+        case 'W':
+            yapioWordLevelVerify = true;
+            break;
+        case 'N':
             yapioNumBlksPerRank = strtoull(optarg, NULL, 10);
+            break;
+        case 'n':
+            yapioNetOnly = true;
             break;
         case 'P':
             yapioPolluteBlks = true;
@@ -1083,6 +1640,25 @@ yapio_getopts(int argc, char **argv)
 
             yapioNumTestGroups++;
             break;
+#ifdef YAPIO_NIOVA
+        case 'v':
+            yapioNiovaVdevFile = optarg;
+            break;
+        case 'C':
+            strncpy(yapioNiovaConnectStr, optarg,
+                    sizeof(yapioNiovaConnectStr) - 1);
+            break;
+        case 'z':
+            yapioNiovaVdevSizeBytes = strtoull(optarg, NULL, 10);
+            break;
+        case 'q':
+            yapioNiovaQueueDepth =
+                MIN((size_t)strtoull(optarg, NULL, 10),
+                    (size_t)YAPIO_NIOVA_MAX_QUEUE_DEPTH);
+            if (yapioNiovaQueueDepth == 0)
+                yapioNiovaQueueDepth = YAPIO_NIOVA_DEF_QUEUE_DEPTH;
+            break;
+#endif
         default:
             yapio_print_help(YAPIO_EXIT_ERR);
             break;
@@ -1090,11 +1666,23 @@ yapio_getopts(int argc, char **argv)
     }
 
     /* Check for user provided test directory parameter which should be at the
-     * end.
+     * end.  Not required in niova mode since IO goes directly to nisd.
      */
     yapioTestRootDir = argv[optind];
-    if (!yapioTestRootDir || argc > (optind + 1))
+    if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+    {
+        if (!yapioTestRootDir || argc > (optind + 1))
+            yapio_print_help(YAPIO_EXIT_ERR);
+    }
+
+#ifdef YAPIO_NIOVA
+    if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA && !yapioNiovaVdevFile)
+    {
+        log_msg(YAPIO_LL_FATAL,
+                "niova mode (-m N) requires a vdev file (-v <path>)");
         yapio_print_help(YAPIO_EXIT_ERR);
+    }
+#endif
 
 //XXX this check needs to be moved
     if ((yapioNumBlksPerRank * yapioBlkSz) > YAPIO_MAX_SIZE_PER_PE)
@@ -1374,6 +1962,20 @@ yapio_destroy_buffers(void)
 
     if (yapioIOBuf)
         YAPIO_FREE(yapioIOBuf);
+
+#ifdef YAPIO_NIOVA
+    if (yapioQueueState.ynqs_slots)
+    {
+        YAPIO_FREE(yapioQueueState.ynqs_slots);
+        yapioQueueState.ynqs_slots = NULL;
+    }
+
+    if (yapioNiovaSlotBufs)
+    {
+        YAPIO_FREE(yapioNiovaSlotBufs);
+        yapioNiovaSlotBufs = NULL;
+    }
+#endif
 }
 
 static void
@@ -1394,6 +1996,25 @@ yapio_alloc_buffers(const yapio_test_group_t *ytg)
     yapioIOBuf = YAPIO_CALLOC(1, ytg->ytg_blk_sz);
     if (yapioIOBuf == NULL)
         yapio_destroy_buffers_and_abort();
+
+#ifdef YAPIO_NIOVA
+    if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+    {
+        /* Allocate the slot pool and per-slot IO buffers.
+         * yapioNiovaQueueDepth is fixed after getopts, ytg_blk_sz is fixed
+         * after test-group setup — both are known at this point.
+         */
+        yapioQueueState.ynqs_slots =
+            YAPIO_CALLOC(yapioNiovaQueueDepth, sizeof(yapio_niova_slot_t));
+        if (yapioQueueState.ynqs_slots == NULL)
+            yapio_destroy_buffers_and_abort();
+
+        yapioNiovaSlotBufs =
+            YAPIO_CALLOC(yapioNiovaQueueDepth, ytg->ytg_blk_sz);
+        if (yapioNiovaSlotBufs == NULL)
+            yapio_destroy_buffers_and_abort();
+    }
+#endif
 }
 
 yapio_blk_md_t *
@@ -1533,8 +2154,32 @@ yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
     {
         yapioSourceBlkMd[i].ybm_writer_rank = yapioMyRank;
 
-        yapioSourceBlkMd[i].ybm_blk_number = ytg->ytg_file_per_process ? i :
-            rel_rank * ytg->ytg_num_blks_per_rank + i;
+        /* In niova mode each rank owns a separate vdev, so block numbers
+         * always start at 0 (same as file-per-process semantics).
+         * In shared-file modes the rank offset is applied so that each rank
+         * writes to a distinct region of the shared file.
+         *
+         * When -z <vdev_size> is specified in niova mode, spread n IOs evenly
+         * across the full vdev (stride = vdev_total_blks / n).  This mirrors
+         * niova-block-test where -N (nops) and the address range are
+         * independent: random IOs pick from [0, max_blk) regardless of -N.
+         */
+        bool fpp = ytg->ytg_file_per_process ||
+                   (yapioModeCurrent == YAPIO_IO_MODE_NIOVA);
+        size_t blk_num = fpp ? i : rel_rank * ytg->ytg_num_blks_per_rank + i;
+
+#ifdef YAPIO_NIOVA
+        if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA &&
+            yapioNiovaVdevSizeBytes > 0 &&
+            ytg->ytg_num_blks_per_rank > 0)
+        {
+            size_t vdev_total_blks = yapioNiovaVdevSizeBytes / ytg->ytg_blk_sz;
+            size_t stride = vdev_total_blks / ytg->ytg_num_blks_per_rank;
+            if (stride < 1) stride = 1;
+            blk_num = i * stride;
+        }
+#endif
+        yapioSourceBlkMd[i].ybm_blk_number = blk_num;
 
         yapioSourceBlkMd[i].ybm_owner_rank_fpp =
             ytg->ytg_file_per_process ? rel_rank : 0;
@@ -1573,12 +2218,43 @@ yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
     unsigned long long *buffer_of_longs = (unsigned long long *)buf;
     size_t num_words = buf_len / sizeof(unsigned long long);
 
-    size_t i;
-    for (i = 0; i < num_words; i++)
+    if (yapioWordLevelVerify)
     {
-        buffer_of_longs[i] = yapio_get_content_word(md, i);
+        /* Word-level unique fill: each 8-byte word gets a distinct value
+         * derived from block metadata + word offset.  Enables per-word
+         * corruption detection but is slow for large block sizes.
+         */
+        size_t i;
+        for (i = 0; i < num_words; i++)
+        {
+            buffer_of_longs[i] = yapio_get_content_word(md, i);
+            log_msg(YAPIO_LL_TRACE, "%zu:%llx", i, buffer_of_longs[i]);
+        }
+    }
+    else
+    {
+        /* Fast seed fill: compute one value per block from block metadata,
+         * write it to the first word, then use exponential memcpy doubling
+         * to broadcast it across the entire buffer.  O(log N) memcpy calls
+         * let libc's SIMD-optimised memcpy do the heavy lifting.
+         */
+        unsigned long long seed =
+            yapio_get_blk_magic(md->ybm_blk_number) +
+            md->ybm_writer_rank +
+            md->ybm_blk_number +
+            md->ybm_owner_rank_fpp;
 
-        log_msg(YAPIO_LL_TRACE, "%zu:%llx", i, buffer_of_longs[i]);
+        buffer_of_longs[0] = seed;
+        size_t filled = sizeof(unsigned long long);
+        while (filled * 2 <= buf_len)
+        {
+            memcpy(buf + filled, buf, filled);
+            filled *= 2;
+        }
+        if (filled < buf_len)
+            memcpy(buf + filled, buf, buf_len - filled);
+
+        log_msg(YAPIO_LL_TRACE, "blk=%lu seed=%llx", md->ybm_blk_number, seed);
     }
 }
 
@@ -1595,20 +2271,43 @@ yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
     const unsigned long long *buffer_of_longs = (unsigned long long *)buf;
     size_t num_words = buf_len / sizeof(unsigned long long);
 
-    size_t i;
-    for (i = 0; i < num_words; i++)
+    if (yapioWordLevelVerify)
     {
-        if (buffer_of_longs[i] != yapio_get_content_word(md, i))
+        size_t i;
+        for (i = 0; i < num_words; i++)
         {
-            unsigned long x = md->ybm_blk_number;
-
-            log_msg(YAPIO_LL_ERROR, "blk=%lu word=%zu got=%llx expected=%llx",
-                    x, i, buffer_of_longs[i], yapio_get_content_word(md, i));
-
-            return -1;
+            if (buffer_of_longs[i] != yapio_get_content_word(md, i))
+            {
+                log_msg(YAPIO_LL_ERROR,
+                        "blk=%lu word=%zu got=%llx expected=%llx",
+                        md->ybm_blk_number, i, buffer_of_longs[i],
+                        yapio_get_content_word(md, i));
+                return -1;
+            }
+            log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
         }
+    }
+    else
+    {
+        /* Re-derive the seed used at write time and verify every word. */
+        unsigned long long seed =
+            yapio_get_blk_magic(md->ybm_blk_number) +
+            md->ybm_writer_rank +
+            md->ybm_blk_number +
+            md->ybm_owner_rank_fpp;
 
-        log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
+        size_t i;
+        for (i = 0; i < num_words; i++)
+        {
+            if (buffer_of_longs[i] != seed)
+            {
+                log_msg(YAPIO_LL_ERROR,
+                        "blk=%lu word=%zu got=%llx expected=%llx",
+                        md->ybm_blk_number, i, buffer_of_longs[i], seed);
+                return -1;
+            }
+            log_msg(YAPIO_LL_TRACE, "OK %zu:%llx", i, buffer_of_longs[i]);
+        }
     }
 
     return 0;
@@ -1685,6 +2384,79 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
                                    &ytc->ytc_num_ops_expected);
 
+    log_msg(YAPIO_LL_DEBUG, "rank=%d op=%s blk_sz=%zu nops=%d",
+            yapioMyRank, ytc->ytc_read ? "read" : "write",
+            ytg->ytg_blk_sz, ytc->ytc_num_ops_expected);
+
+#ifdef YAPIO_NIOVA
+    if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+    {
+        /* Niova path: iopm-callback event loop.
+         * The iopm worker thread inside yapioNiovaClient drives all IO via
+         * yapio_niova_queue_work_cb() and yapio_niova_completion_cb().
+         * The MPI main thread blocks here on a single condvar until done.
+         */
+        yapio_niova_queue_state_t *qs = &yapioQueueState;
+
+        /* Preserve the slot array allocated in yapio_alloc_buffers() across
+         * the reset — it is reused across multiple yapio_perform_io() calls.
+         */
+        yapio_niova_slot_t *saved_slots = qs->ynqs_slots;
+        memset(qs, 0, sizeof(*qs));
+        qs->ynqs_slots = saved_slots;
+
+        pthread_mutex_init(&qs->ynqs_done_mutex, NULL);
+        pthread_cond_init(&qs->ynqs_done_cond, NULL);
+
+        CIRCLEQ_INIT(&qs->ynqs_idle);
+        CIRCLEQ_INIT(&qs->ynqs_running);
+
+        qs->ynqs_num_ioh      = MIN(ytc->ytc_num_ops_expected,
+                                    (int)yapioNiovaQueueDepth);
+        qs->ynqs_md_array     = md_array;
+        qs->ynqs_total_blocks = ytc->ytc_num_ops_expected;
+        qs->ynqs_target       = ytc->ytc_num_ops_expected;
+        qs->ynqs_blk_sz       = ytg->ytg_blk_sz;
+        qs->ynqs_is_read      = ytc->ytc_read;
+        qs->ynqs_ytc          = ytc;
+
+        ytc->ytc_num_ops_completed_before_stonewall = 0;
+
+        /* Wire up per-slot IO buffers and populate the idle queue */
+        for (size_t i = 0; i < yapioNiovaQueueDepth; i++)
+        {
+            qs->ynqs_slots[i].yns_buf =
+                yapioNiovaSlotBufs + i * ytg->ytg_blk_sz;
+            CIRCLEQ_INSERT_TAIL(&qs->ynqs_idle,
+                                &qs->ynqs_slots[i], yns_lentry);
+        }
+
+        /* Setting ynqs_ready=true allows yapio_niova_queue_work_cb() —
+         * already being called by the iopm worker thread — to start
+         * submitting IO.  No barrier is needed: the iopm thread will pick
+         * up the flag on its next iteration.
+         */
+        qs->ynqs_ready = true;
+
+        /* MPI main thread waits here; all IO happens on the iopm thread. */
+        pthread_mutex_lock(&qs->ynqs_done_mutex);
+        while (!qs->ynqs_done)
+            pthread_cond_wait(&qs->ynqs_done_cond, &qs->ynqs_done_mutex);
+        pthread_mutex_unlock(&qs->ynqs_done_mutex);
+
+        rc = qs->ynqs_error;
+
+        pthread_mutex_destroy(&qs->ynqs_done_mutex);
+        pthread_cond_destroy(&qs->ynqs_done_cond);
+
+        return rc;
+    }
+#endif
+
+    /* POSIX path: sequential j-loop. */
+    const int print_interval = ytc->ytc_num_ops_expected > 10
+                               ? ytc->ytc_num_ops_expected / 10 : 1;
+
     int j;
     for (j = 0, ytc->ytc_num_ops_completed_before_stonewall = 0;
          j < ytc->ytc_num_ops_expected;
@@ -1703,9 +2475,13 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         if (!ytc->ytc_read)
             yapio_apply_contents_to_io_buffer(yapioIOBuf, ytg->ytg_blk_sz, md);
 
-        /* Obtain this IO's offset from the
-         */
         off_t off = yapio_get_rw_offset(md, ytg->ytg_blk_sz);
+
+        if (j % print_interval == 0)
+            log_msg(YAPIO_LL_DEBUG, "rank=%d %s op=%d/%d off=%lu blk=%lu",
+                    yapioMyRank, ytc->ytc_read ? "read" : "write",
+                    j, ytc->ytc_num_ops_expected,
+                    (unsigned long)off, md->ybm_blk_number);
         if (off < 0)
         {
             log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed");
@@ -1720,23 +2496,27 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         }
 
         ssize_t io_rc, io_bytes = 0;
+
+        /* POSIX: loop to handle short reads/writes. */
         do
         {
-            char *adjusted_buf = yapioIOBuf + io_bytes;
-            size_t adjusted_io_len = ytg->ytg_blk_sz - io_bytes;
-            off_t adjusted_off = off + io_bytes;
+            char *adjusted_buf    = yapioIOBuf + io_bytes;
+            size_t adjusted_len   = ytg->ytg_blk_sz - io_bytes;
+            off_t  adjusted_off   = off + io_bytes;
+
             int fd_idx = md->ybm_owner_rank_fpp;
             int fd = yapio_get_fd(fd_idx);
 
             io_rc = ytc->ytc_read ?
-                YAPIO_SYS_CALL(pread)(fd, adjusted_buf, adjusted_io_len,
+                YAPIO_SYS_CALL(pread)(fd, adjusted_buf, adjusted_len,
                                       adjusted_off) :
-                YAPIO_SYS_CALL(pwrite)(fd, adjusted_buf, adjusted_io_len,
+                YAPIO_SYS_CALL(pwrite)(fd, adjusted_buf, adjusted_len,
                                        adjusted_off);
 
             log_msg(YAPIO_LL_DEBUG, "%s rc=%zd off=%lu@%d fr=%d",
-                    ytc->ytc_read ? "pread" : "pwrite", io_rc, adjusted_off,
-                    fd_idx, ytg->ytg_first_rank);
+                    ytc->ytc_read ? "pread" : "pwrite", io_rc,
+                    (unsigned long)adjusted_off, fd_idx,
+                    ytg->ytg_first_rank);
 
             if (io_rc > 0)
                 io_bytes += io_rc;
@@ -1760,7 +2540,6 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         }
     }
 
-//    if (!rc && !ytc->ytc_no_fsync)
     if (!ytc->ytc_no_fsync && !yapioStoneWalled)
     {
         int fsync_rc = yapio_fsync();
@@ -1906,6 +2685,18 @@ yapio_test_context_sequential_setup_for_rank(yapio_test_ctx_t *ytc, int rank)
             log_msg(YAPIO_LL_DEBUG, "update writer rank for op #%d\n", i);
             yapio_source_md_update_writer_rank(src_idx, rank);
         }
+#ifdef YAPIO_NIOVA
+        /* In niova mode the vdev is persistent; a read run after a prior write
+         * run will find real data at every block.  Mark blocks as not-hole so
+         * yapio_verify_contents_of_io_buffer() actually verifies the content
+         * instead of silently skipping it.
+         */
+        else if (ytc->ytc_read && !skip_io &&
+                 yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+        {
+            yapioSourceBlkMd[src_idx].ybm_not_hole = 1;
+        }
+#endif
 
         md[i] = yapioSourceBlkMd[src_idx];
 
@@ -2291,7 +3082,11 @@ yapio_verify_test_contexts(yapio_test_group_t *ytg)
         if (!ytc->ytc_read)
             ytg->ytg_last_writer_ctx = i;
 
-        if (!i && ytc->ytc_read && !ytg->ytg_restart_from_previous_job)
+        if (!i && ytc->ytc_read && !ytg->ytg_restart_from_previous_job
+#ifdef YAPIO_NIOVA
+            && yapioModeCurrent != YAPIO_IO_MODE_NIOVA
+#endif
+            )
         {
             if (yapio_leader_rank())
             {
@@ -2941,9 +3736,18 @@ main(int argc, char *argv[])
 
     yapio_io_mode_init();
 
+#ifdef YAPIO_NIOVA
+    if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+    {
+        /* Connect to niova before allocating IO buffers. */
+        yapio_niova_setup_clients();
+    }
+#endif
+
     yapio_setup_buffers(yapioMyTestGroup);
 
-    yapio_setup_test_file(yapioMyTestGroup);
+    if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+        yapio_setup_test_file(yapioMyTestGroup);
 
     if (yapio_global_leader_rank())
         yapio_start_stats_collection_and_reporting_threads();
@@ -2957,14 +3761,21 @@ main(int argc, char *argv[])
 
     yapio_mpi_barrier(MPI_COMM_WORLD);
 
-    yapio_close_test_file(yapioMyTestGroup);
+    if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+        yapio_close_test_file(yapioMyTestGroup);
 
     if (yapio_global_leader_rank())
         yapio_destroy_collection_and_reporting_threads();
 
     yapio_destroy_buffers();
 
-    yapio_unlink_test_file();
+    if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+        yapio_unlink_test_file();
+
+#ifdef YAPIO_NIOVA
+    if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+        yapio_niova_teardown_clients();
+#endif
 
     yapio_exit(yapio_io_mode_finalize());
 
