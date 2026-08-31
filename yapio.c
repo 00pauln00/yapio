@@ -45,7 +45,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:r:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -80,6 +80,8 @@ enum yapio_patterns
 
 static size_t      yapioNumBlksPerRank = YAPIO_DEF_NBLKS_PER_PE;
 static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
+static unsigned int yapioRandSeed         = 0;     /* set via -r <seed>       */
+static bool          yapioRandSeedExplicit = false; /* true once -r is parsed */
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioPolluteBlks    = false;
@@ -1111,6 +1113,10 @@ yapio_print_help(int exit_val)
                 "\t-V  Disable read verification\n"
                 "\t-W  Enable word-level buffer uniqueness (default: fast seed fill)\n"
                 "\t-q  Niova queue depth (default 12, max 256, niova mode only)\n"
+                "\t-r  Random seed: pins the block-shuffle / sparse-IO PRNG\n"
+                "\t    so a run is exactly reproducible. Default (no -r):\n"
+                "\t    still random, but the resolved base seed is printed\n"
+                "\t    at startup so a failing run can be reproduced later.\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -1622,6 +1628,10 @@ yapio_getopts(int argc, char **argv)
         case 'P':
             yapioPolluteBlks = true;
             break;
+        case 'r':
+            yapioRandSeed = (unsigned int)strtoul(optarg, NULL, 10);
+            yapioRandSeedExplicit = true;
+            break;
         case 's':
             yapioDisplayStats = true;
             break;
@@ -2021,12 +2031,42 @@ yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
                            enum yapio_test_ctx_mdh_in_out, int *);
 
+/* Seed libc's PRNG exactly once, early in main(), so every subsequent
+ * rand() call in this process (yapio_blk_md_randomize()'s block shuffle,
+ * skip_io_or_not()'s sparse-IO hole selection) draws from one deterministic
+ * stream. With -r <seed>, the stream is fully reproducible run-to-run --
+ * needed to reliably reproduce a specific failing run for
+ * debugging. Without -r, falls back to a source that still varies
+ * per-run/per-rank (time+pid), matching the previous non-reproducible
+ * behavior this replaces -- srand(time(NULL)) used to be called fresh on
+ * every skip_io_or_not() invocation (1-second granularity, so back-to-back
+ * calls could draw identical "random" values), and
+ * yapio_blk_md_randomize() read raw entropy from /dev/urandom every call;
+ * neither could ever be pinned to reproduce a specific sequence.
+ *
+ * The per-rank offset keeps concurrent ranks from all shuffling their
+ * blocks identically while still being fully deterministic once a base
+ * seed is fixed via -r.
+ */
+static void
+yapio_seed_rng(void)
+{
+    unsigned int base_seed = yapioRandSeedExplicit ? yapioRandSeed :
+        ((unsigned int)time(NULL) ^ (unsigned int)getpid());
+
+    srand(base_seed + (unsigned int)yapioMyRank);
+
+    if (yapio_global_leader_rank())
+        fprintf(stderr,
+                "[rand] base seed=%u%s -- pass -r %u to reproduce this "
+                "run's random block order / sparse-IO pattern\n",
+                base_seed, yapioRandSeedExplicit ? "" : " (unseeded)",
+                base_seed);
+}
+
 static bool
 skip_io_or_not(int ops_left, int skips_left)
 {
-    /* for random number generation */
-    srand(time(NULL));
-
     /* skip randomly or skip all remaining IOs
      * because there's no room for choosing */
     if (skips_left &&
@@ -2606,35 +2646,27 @@ yapio_test_ctx_release(yapio_test_ctx_t *ytc)
         yapio_test_ctx_release_md(&ytc->ytc_in_out_md_ops[i]);
 }
 
-static int
-yapio_read_from_dev_urandom(void *buffer, size_t size)
+/* Fill 'buffer' with 'size' bytes drawn from the process's seeded rand()
+ * stream (see yapio_seed_rng()) rather than /dev/urandom, so the resulting
+ * block-order shuffle is reproducible whenever -r <seed> pins that stream.
+ * rand()'s statistical quality is more than sufficient for permuting block
+ * visitation order in an I/O test -- this isn't a security context.
+ */
+static void
+yapio_fill_randoms(void *buffer, size_t size)
 {
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0)
+    int *out = buffer;
+    size_t nints = size / sizeof(int);
+
+    for (size_t i = 0; i < nints; i++)
+        out[i] = rand();
+
+    size_t rem = size % sizeof(int);
+    if (rem)
     {
-        fd = -errno;
-        log_msg(YAPIO_LL_ERROR, "open: %s", strerror(errno));
-        return fd;
+        int last = rand();
+        memcpy((char *)buffer + nints * sizeof(int), &last, rem);
     }
-
-    int error = 0;
-    size_t nbytes = 0;
-    do
-    {
-        ssize_t rc = read(fd, ((char *)buffer) + nbytes, size - nbytes);
-        if (rc < 0)
-        {
-            error = -errno;
-            log_msg(YAPIO_LL_ERROR, "read: %s", strerror(errno));
-            break;
-        }
-
-        nbytes += rc;
-
-    } while (nbytes < size);
-
-    close(fd);
-    return error;
 }
 
 static yapio_blk_md_t *
@@ -2722,12 +2754,7 @@ yapio_blk_md_randomize(const yapio_blk_md_t *md_in, yapio_blk_md_t *md_out,
     if (!array_of_randoms)
         return -ENOMEM;
 
-    int rc = yapio_read_from_dev_urandom((void *)array_of_randoms, buf_sz);
-    if (rc)
-    {
-        YAPIO_FREE(array_of_randoms);
-        return rc;
-    }
+    yapio_fill_randoms((void *)array_of_randoms, buf_sz);
 
     size_t i;
     if (initialize_md_out)
@@ -3729,6 +3756,8 @@ main(int argc, char *argv[])
     yapio_mpi_setup(argc, argv);
 
     yapio_getopts(argc, argv);
+
+    yapio_seed_rng();
 
     yapio_assign_rank_to_group();
 
