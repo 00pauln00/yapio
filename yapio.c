@@ -552,8 +552,14 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
     }
     else if (state->ynqs_is_read && yapioVerifyRead && !state->ynqs_error)
     {
+        /* slot->yns_iov.iov_len, not state->ynqs_blk_sz: the last block
+         * may have been clamped shorter than the queue's nominal blk_sz
+         * (see yapio_niova_queue_work_cb) to keep an unaligned vdev tail
+         * in bounds -- verifying against the full blk_sz here would flag
+         * that clamped read as corrupted for bytes never actually read.
+         */
         int vrc = yapio_verify_contents_of_io_buffer(slot->yns_buf,
-                                                     state->ynqs_blk_sz,
+                                                     slot->yns_iov.iov_len,
                                                      slot->yns_md);
         if (vrc && !state->ynqs_error)
             state->ynqs_error = vrc;
@@ -641,19 +647,53 @@ yapio_niova_queue_work_cb(void *arg)
             break;
         }
 
+        /* Clamp the last block: if the vdev size isn't an exact multiple
+         * of blk_sz (e.g. -b doesn't evenly divide a CP-reported or -z
+         * vdev size), the final block's [off, off+blk_sz) range can
+         * extend past the actual device boundary even though 'off' itself
+         * is in range. niova addresses in YAPIO_NIOVA_BLOCK_SIZE (4K)
+         * vblk units, so round the remaining space down to a whole number
+         * of vblks -- if nothing whole is left, there's no valid I/O here
+         * at all; treat it the same as an explicitly-skipped block.
+         */
+        size_t io_len = state->ynqs_blk_sz;
+        if (yapioNiovaVdevSizeBytes > 0 &&
+            (size_t)off + io_len > yapioNiovaVdevSizeBytes)
+        {
+            size_t remaining = (size_t)off < yapioNiovaVdevSizeBytes ?
+                yapioNiovaVdevSizeBytes - (size_t)off : 0;
+            io_len = (remaining / YAPIO_NIOVA_BLOCK_SIZE) *
+                     YAPIO_NIOVA_BLOCK_SIZE;
+
+            log_msg(YAPIO_LL_WARN,
+                    "clamping j=%d off=%lld blk_sz=%zu -> io_len=%zu "
+                    "(vdev_size=%zu, block would exceed device boundary)",
+                    state->ynqs_next_j - 1, (long long)off,
+                    state->ynqs_blk_sz, io_len, yapioNiovaVdevSizeBytes);
+
+            if (io_len == 0)
+            {
+                state->ynqs_ncompleted++;
+                state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
+                to_submit++;
+                if (state->ynqs_ncompleted >= state->ynqs_target)
+                    yapio_niova_signal_done(state);
+                continue;
+            }
+        }
+
         yapio_niova_slot_t *slot = CIRCLEQ_FIRST(&state->ynqs_idle);
         CIRCLEQ_REMOVE(&state->ynqs_idle, slot, yns_lentry);
 
         slot->yns_md           = md;
         slot->yns_iov.iov_base = slot->yns_buf;
-        slot->yns_iov.iov_len  = state->ynqs_blk_sz;
+        slot->yns_iov.iov_len  = io_len;
         slot->yns_running      = true;
 
         vdev_vblk_t vblk = (vdev_vblk_t)(off / YAPIO_NIOVA_BLOCK_SIZE);
 
         if (!state->ynqs_is_read)
-            yapio_apply_contents_to_io_buffer(slot->yns_buf,
-                                               state->ynqs_blk_sz, md);
+            yapio_apply_contents_to_io_buffer(slot->yns_buf, io_len, md);
 
         CIRCLEQ_INSERT_TAIL(&state->ynqs_running, slot, yns_lentry);
         state->ynqs_ioh_in_progress++;
@@ -661,7 +701,7 @@ yapio_niova_queue_work_cb(void *arg)
         log_msg(YAPIO_LL_DEBUG, "niova %s submit j=%d vblk=%lu bytes=%zu",
                 state->ynqs_is_read ? "READ" : "WRITE",
                 state->ynqs_next_j - 1,
-                (uint64_t)vblk, state->ynqs_blk_sz);
+                (uint64_t)vblk, io_len);
 
         int rc = state->ynqs_is_read
             ? NiovaBlockClientReadv(yapioNiovaClient, vblk,
