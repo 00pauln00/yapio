@@ -2071,18 +2071,34 @@ yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
                            enum yapio_test_ctx_mdh_in_out, int *);
 
-/* Seed libc's PRNG exactly once, early in main(), so every subsequent
- * rand() call in this process (yapio_blk_md_randomize()'s block shuffle,
- * skip_io_or_not()'s sparse-IO hole selection) draws from one deterministic
- * stream. With -r <seed>, the stream is fully reproducible run-to-run --
- * needed to reliably reproduce a specific failing run for
- * debugging. Without -r, falls back to a source that still varies
- * per-run/per-rank (time+pid), matching the previous non-reproducible
+/* Persists the base seed yapio_seed_rng() establishes so
+ * yapio_reseed_for_phase() can re-apply the exact same value before every
+ * test phase, rather than recomputing it -- recomputing would drift
+ * phase-to-phase in the unseeded time()-based fallback if a phase takes
+ * any measurable wall-clock time.
+ */
+static unsigned int yapioEffectiveBaseSeed;
+
+/* Seed libc's PRNG, once early in main() and again before every test
+ * phase (see yapio_reseed_for_phase()), so every rand() call in this
+ * process (yapio_blk_md_randomize()'s block shuffle, skip_io_or_not()'s
+ * sparse-IO hole selection) draws from one deterministic stream *per
+ * phase* rather than one continuous stream across all phases. With
+ * -r <seed>, this makes a read phase -- whether later in this same run,
+ * or in a wholly separate invocation started days later with the same
+ * -r -- re-derive the identical block order and hole selection an
+ * earlier write phase used, so it reads back exactly what was actually
+ * written, including which blocks were left as holes.
+ *
+ * Without -r, falls back to a source that still varies per-run/per-rank
+ * (time+pid) but is now fixed across every phase *within* one run --
+ * matching the previous non-reproducible-across-separate-runs default
  * behavior this replaces -- srand(time(NULL)) used to be called fresh on
  * every skip_io_or_not() invocation (1-second granularity, so back-to-back
  * calls could draw identical "random" values), and
  * yapio_blk_md_randomize() read raw entropy from /dev/urandom every call;
- * neither could ever be pinned to reproduce a specific sequence.
+ * neither could ever be pinned to reproduce a specific sequence, let alone
+ * the same sequence across a write phase and its matching read phase.
  *
  * The per-rank offset keeps concurrent ranks from all shuffling their
  * blocks identically while still being fully deterministic once a base
@@ -2091,17 +2107,32 @@ yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
 static void
 yapio_seed_rng(void)
 {
-    unsigned int base_seed = yapioRandSeedExplicit ? yapioRandSeed :
+    yapioEffectiveBaseSeed = yapioRandSeedExplicit ? yapioRandSeed :
         ((unsigned int)time(NULL) ^ (unsigned int)getpid());
 
-    srand(base_seed + (unsigned int)yapioMyRank);
+    srand(yapioEffectiveBaseSeed + (unsigned int)yapioMyRank);
 
     if (yapio_global_leader_rank())
         fprintf(stderr,
                 "[rand] base seed=%u%s -- pass -r %u to reproduce this "
                 "run's random block order / sparse-IO pattern\n",
-                base_seed, yapioRandSeedExplicit ? "" : " (unseeded)",
-                base_seed);
+                yapioEffectiveBaseSeed,
+                yapioRandSeedExplicit ? "" : " (unseeded)",
+                yapioEffectiveBaseSeed);
+}
+
+/* Re-apply the exact same base seed yapio_seed_rng() established, at the
+ * start of every test phase (see yapio_test_context_setup()) instead of
+ * letting rand() calls continue across phases in one unbroken stream.
+ * See yapio_seed_rng()'s comment for why this matters.
+ */
+static void
+yapio_reseed_for_phase(void)
+{
+    srand(yapioEffectiveBaseSeed + (unsigned int)yapioMyRank);
+
+    log_msg(YAPIO_LL_DEBUG, "reseed base=%u rank=%d",
+            yapioEffectiveBaseSeed, yapioMyRank);
 }
 
 static bool
@@ -3103,6 +3134,8 @@ yapio_test_context_setup(yapio_test_ctx_t *ytc, const int test_num)
 {
     ytc->ytc_test_num = test_num;
     ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_NOT_STARTED;
+
+    yapio_reseed_for_phase();
 
     int rc = ytc->ytc_remote_locality ?
         yapio_test_context_setup_distributed(ytc) :
