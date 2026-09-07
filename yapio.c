@@ -468,8 +468,8 @@ yapio_exit(int exit_rc)
  * niova-block-test.c client mode, adapted for yapio's MPI main-thread model.
  * -------------------------------------------------------------------------*/
 
-#define YAPIO_NIOVA_DEF_QUEUE_DEPTH   12
-#define YAPIO_NIOVA_MAX_QUEUE_DEPTH  256
+#define YAPIO_NIOVA_DEF_QUEUE_DEPTH     12
+#define YAPIO_NIOVA_MAX_QUEUE_DEPTH  10240
 
 static size_t yapioNiovaQueueDepth = YAPIO_NIOVA_DEF_QUEUE_DEPTH;
 static char  *yapioNiovaSlotBufs   = NULL;
