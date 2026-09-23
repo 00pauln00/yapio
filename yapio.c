@@ -45,7 +45,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:r:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:r:x:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -80,8 +80,30 @@ enum yapio_patterns
 
 static size_t      yapioNumBlksPerRank = YAPIO_DEF_NBLKS_PER_PE;
 static size_t      yapioBlkSz          = YAPIO_DEF_BLK_SIZE;
+static bool        yapioBlkSzExplicit  = false; /* true once -b is parsed */
+/* Set via -x <min>:<max> (niova mode only) — enables the random per-block
+ * IO size mode used to make a single vdev produce a mix of ECE (full
+ * erasure-coded stripe) and ECRE (replicated partial/remainder) writes
+ * instead of one uniform size for the whole run.
+ * yapioIoSizeRandomEnabled == false means disabled (fixed ytg_blk_sz
+ * behaviour, unchanged from before).
+ *
+ * When enabled, ytg_blk_sz (see yapio_test_group_init()) holds the upper
+ * bound of the range -- it keeps serving its existing role as the
+ * address-space stride and buffer-allocation size everywhere in the file,
+ * so none of that code needs to change. yapioIoSizeMin holds the lower
+ * bound. The actual per-block transfer length is drawn by
+ * yapio_pick_io_size() (niova mode, see below) at submission time.
+ */
+static size_t      yapioIoSizeMin          = 0;
+static size_t      yapioIoSizeMax          = 0;
+static bool        yapioIoSizeRandomEnabled = false;
 static unsigned int yapioRandSeed         = 0;     /* set via -r <seed>       */
 static bool          yapioRandSeedExplicit = false; /* true once -r is parsed */
+/* Set by yapio_seed_rng(); see the comment above that function for why this
+ * is persisted rather than recomputed per phase. Declared here (rather than
+ * next to yapio_seed_rng()) so yapio_pick_io_size() can use it. */
+static unsigned int yapioEffectiveBaseSeed;
 static int         yapioDbgLevel       = YAPIO_LL_WARN;
 static bool        yapioMpiInit        = false;
 static bool        yapioPolluteBlks    = false;
@@ -351,7 +373,10 @@ typedef struct yapio_test_group
     int              ytg_first_rank;
     int              ytg_num_ranks;
     size_t           ytg_num_blks_per_rank;
-    size_t           ytg_blk_sz;
+    size_t           ytg_blk_sz;          /* -x mode: upper bound of range  */
+    size_t           ytg_io_size_min;     /* -x mode: lower bound; 0=disabled*/
+    bool             ytg_io_size_random;  /* true when -x mode is active    */
+    bool             ytg_blk_sz_explicit; /* true if recipe used B<size>    */
     bool             ytg_file_per_process;
     bool             ytg_keep_file;
     bool             ytg_leader_rank;
@@ -498,6 +523,8 @@ typedef struct {
     int                           ynqs_next_j;     /* next md_array index to submit  */
     int                           ynqs_target;     /* completions needed before done  */
     size_t                        ynqs_blk_sz;
+    size_t                        ynqs_io_size_min;  /* 0 unless -x mode    */
+    bool                          ynqs_io_size_random;
     bool                          ynqs_is_read;
     bool                          ynqs_ready;      /* main thread sets true to start  */
     yapio_test_ctx_t             *ynqs_ytc;        /* for stonewall + completed count */
@@ -581,6 +608,47 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
         yapio_niova_signal_done(state);
 }
 
+/* yapio_pick_io_size - deterministic per-block IO size draw for the -x
+ * random-IO-size mode.  Returns a value in [min_sz, max_sz], rounded down
+ * to a YAPIO_NIOVA_BLOCK_SIZE (4K) multiple.
+ *
+ * This is a pure function of (base seed, this rank, block number) — not a
+ * draw from the shared rand() stream used elsewhere in this file — so it
+ * recomputes identically no matter which order blocks are visited in,
+ * which test phase is asking, or whether it's a wholly separate invocation
+ * days later with the same -r seed. That matters here: a write phase and
+ * its matching read phase (or a restart-from-previous-job run) must derive
+ * the exact same length for a given block, and they don't necessarily walk
+ * blocks in the same order or make the same number of rand() calls (sparse
+ * IO skips, distributed-locality shuffling, etc. all consume rand() at
+ * different rates). This mirrors yapio_get_content_word()'s approach to
+ * the same problem for buffer contents: hash stable per-block identity
+ * instead of relying on stream position.
+ *
+ * Since each rank owns exactly one vdev for the life of the run and the
+ * vdev-file's rank-to-vdev mapping is stable across runs, (rank, blk_num)
+ * uniquely and reproducibly identifies a byte range on a specific vdev.
+ */
+static size_t
+yapio_pick_io_size(size_t blk_number, size_t min_sz, size_t max_sz)
+{
+    if (min_sz >= max_sz)
+        return max_sz;
+
+    uint64_t x = (uint64_t)yapioEffectiveBaseSeed ^
+                 ((uint64_t)yapioMyRank << 32) ^ (uint64_t)blk_number;
+
+    /* splitmix64 mix step — cheap, well-distributed, no library dependency. */
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x =  x ^ (x >> 31);
+
+    size_t nsteps = (max_sz - min_sz) / YAPIO_NIOVA_BLOCK_SIZE + 1;
+
+    return min_sz + (size_t)(x % nsteps) * YAPIO_NIOVA_BLOCK_SIZE;
+}
+
 /* iopm runtime callback — runs on the iopm worker thread on every iteration.
  * Mirrors nbti_queue_work() in niova-block-test.c client mode.
  * No mutex needed: both this function and yapio_niova_completion_cb run on
@@ -647,16 +715,25 @@ yapio_niova_queue_work_cb(void *arg)
             break;
         }
 
+        /* -x mode: draw this block's transfer length independently of the
+         * offset stride (state->ynqs_blk_sz keeps acting as the stride /
+         * buffer-allocation size — see yapioIoSizeMax's comment). Otherwise
+         * unchanged: fixed size, as before.
+         */
+        size_t io_len = state->ynqs_io_size_random ?
+            yapio_pick_io_size(md->ybm_blk_number, state->ynqs_io_size_min,
+                               state->ynqs_blk_sz) :
+            state->ynqs_blk_sz;
+
         /* Clamp the last block: if the vdev size isn't an exact multiple
-         * of blk_sz (e.g. -b doesn't evenly divide a CP-reported or -z
-         * vdev size), the final block's [off, off+blk_sz) range can
+         * of io_len (e.g. -b doesn't evenly divide a CP-reported or -z
+         * vdev size), the final block's [off, off+io_len) range can
          * extend past the actual device boundary even though 'off' itself
          * is in range. niova addresses in YAPIO_NIOVA_BLOCK_SIZE (4K)
          * vblk units, so round the remaining space down to a whole number
          * of vblks -- if nothing whole is left, there's no valid I/O here
          * at all; treat it the same as an explicitly-skipped block.
          */
-        size_t io_len = state->ynqs_blk_sz;
         if (yapioNiovaVdevSizeBytes > 0 &&
             (size_t)off + io_len > yapioNiovaVdevSizeBytes)
         {
@@ -947,10 +1024,17 @@ yapio_niova_setup_clients(void)
                     "  target-addr  : %s:%u\n",
                     xopts.npcx_opts.net_target_addr,
                     xopts.npcx_opts.net_target_port);
+
+        if (yapioIoSizeRandomEnabled)
+            fprintf(stderr,
+                    "  io-size      : random per-block [%zu, %zu] bytes "
+                    "(-x, pinned by -r seed=%u)\n",
+                    yapioIoSizeMin, yapioIoSizeMax, yapioEffectiveBaseSeed);
     }
 
-    /* Validate that the user's -b block size is a multiple of the niova
-     * 4K vblk size.  Do not override it — the user controls IO size via -b.
+    /* Validate that the user's -b block size (or, in -x mode, the upper
+     * bound of the random range) is a multiple of the niova 4K vblk size.
+     * Do not override it — the user controls IO size via -b / -x.
      */
     for (int i = 0; i < yapioNumTestGroups; i++)
     {
@@ -1157,6 +1241,14 @@ yapio_print_help(int exit_val)
                 "\t    so a run is exactly reproducible. Default (no -r):\n"
                 "\t    still random, but the resolved base seed is printed\n"
                 "\t    at startup so a failing run can be reproduced later.\n"
+                "\t-x  <min>:<max>  Random per-block IO size (niova mode\n"
+                "\t    only; mutually exclusive with -b / -t's B param).\n"
+                "\t    Each block's transfer length is drawn deterministically\n"
+                "\t    from [min,max] (multiples of 4096), independently per\n"
+                "\t    vdev and per block, so a single vdev's writes mix\n"
+                "\t    small unaligned I/Os (ECRE-only) with large\n"
+                "\t    stripe-aligned I/Os (ECE) and everything between.\n"
+                "\t    Pinned by -r like the rest of the PRNG state.\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -1256,7 +1348,16 @@ yapio_test_group_init(yapio_test_group_t *ytg)
 {
     ytg->ytg_num_contexts = 1;
     ytg->ytg_num_blks_per_rank = yapioNumBlksPerRank;
+    /* Default to the fixed -b size here. If -x <min>:<max> is in effect,
+     * yapio_getopts() overwrites ytg_blk_sz/ytg_io_size_min/ytg_io_size_random
+     * for every test group in one pass *after* the whole command line has
+     * been parsed -- -t and -x can appear in either order on the command
+     * line, and doing the override here (at -t parse time) would silently
+     * lose it whenever -x comes after -t.
+     */
     ytg->ytg_blk_sz = yapioBlkSz;
+    ytg->ytg_io_size_min = 0;
+    ytg->ytg_io_size_random = false;
     ytg->ytg_file_per_process = false;
     ytg->ytg_restart_from_previous_job = false;
     ytg->ytg_group_num = yapioNumTestGroups;
@@ -1312,6 +1413,7 @@ yapio_parse_test_recipe(const char *recipe_str)
             ytg->ytg_restart_from_previous_job = true;
             break;
         case 'B':
+            ytg->ytg_blk_sz_explicit = true;
             i += yapio_test_recipe_param_to_ull(&recipe_str[i + 1],
                                                 &ytg->ytg_blk_sz);
             break;
@@ -1634,6 +1736,7 @@ yapio_getopts(int argc, char **argv)
         {
         case 'b':
             yapioBlkSz = strtoull(optarg, NULL, 10);
+            yapioBlkSzExplicit = true;
             if (yapioBlkSz == 0 || yapioBlkSz % YAPIO_NIOVA_BLOCK_SIZE != 0)
             {
                 fprintf(stderr, "Block size must be a non-zero multiple of %d.\n",
@@ -1708,6 +1811,33 @@ yapio_getopts(int argc, char **argv)
             if (yapioNiovaQueueDepth == 0)
                 yapioNiovaQueueDepth = YAPIO_NIOVA_DEF_QUEUE_DEPTH;
             break;
+        case 'x':
+        {
+            char *sep = strchr(optarg, ':');
+            if (!sep)
+            {
+                fprintf(stderr,
+                        "-x requires <min>:<max>, e.g. -x 4096:1048576\n");
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            yapioIoSizeMin = strtoull(optarg, NULL, 10);
+            yapioIoSizeMax = strtoull(sep + 1, NULL, 10);
+
+            if (yapioIoSizeMin == 0 || yapioIoSizeMax == 0 ||
+                yapioIoSizeMin > yapioIoSizeMax ||
+                yapioIoSizeMin % YAPIO_NIOVA_BLOCK_SIZE != 0 ||
+                yapioIoSizeMax % YAPIO_NIOVA_BLOCK_SIZE != 0)
+            {
+                fprintf(stderr,
+                        "-x <min>:<max> must be non-zero multiples of %d "
+                        "with min <= max.\n", YAPIO_NIOVA_BLOCK_SIZE);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            yapioIoSizeRandomEnabled = true;
+            break;
+        }
 #endif
         default:
             yapio_print_help(YAPIO_EXIT_ERR);
@@ -1731,6 +1861,60 @@ yapio_getopts(int argc, char **argv)
         log_msg(YAPIO_LL_FATAL,
                 "niova mode (-m N) requires a vdev file (-v <path>)");
         yapio_print_help(YAPIO_EXIT_ERR);
+    }
+
+    if (yapioIoSizeRandomEnabled)
+    {
+        if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "-x <min>:<max> requires niova mode (-m N)");
+            yapio_print_help(YAPIO_EXIT_ERR);
+        }
+        if (yapioBlkSzExplicit)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "-b and -x <min>:<max> are mutually exclusive");
+            yapio_print_help(YAPIO_EXIT_ERR);
+        }
+
+        /* Apply the range to every test group parsed so far, in one pass
+         * now that the whole command line is in.  See the comment in
+         * yapio_test_group_init() for why this can't be done at -t
+         * parse time.
+         */
+        for (int i = 0; i < yapioNumTestGroups; i++)
+        {
+            if (yapioTestGroups[i].ytg_blk_sz_explicit)
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "-t B<size> and -x <min>:<max> are mutually "
+                        "exclusive (test group %d)", i);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            /* Worst-case per-rank footprint uses the range's upper bound
+             * since that's what ytg_blk_sz (the address-space stride) is
+             * about to become -- the generic check below this ifdef block
+             * only ever looks at the global yapioBlkSz, which -x never
+             * touches, so it would silently miss an oversized -x range.
+             */
+            size_t per_rank_bytes =
+                yapioTestGroups[i].ytg_num_blks_per_rank * yapioIoSizeMax;
+            if (per_rank_bytes > YAPIO_MAX_SIZE_PER_PE)
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "-x: per-rank data size (%zu, using max=%zu) "
+                        "exceeds max (%llu) for test group %d",
+                        per_rank_bytes, yapioIoSizeMax,
+                        YAPIO_MAX_SIZE_PER_PE, i);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            yapioTestGroups[i].ytg_blk_sz = yapioIoSizeMax;
+            yapioTestGroups[i].ytg_io_size_min = yapioIoSizeMin;
+            yapioTestGroups[i].ytg_io_size_random = true;
+        }
     }
 #endif
 
@@ -2071,13 +2255,14 @@ yapio_blk_md_t *
 yapio_test_ctx_to_md_array(const yapio_test_ctx_t *,
                            enum yapio_test_ctx_mdh_in_out, int *);
 
-/* Persists the base seed yapio_seed_rng() establishes so
+/* yapioEffectiveBaseSeed is declared near the top of the file (with
+ * yapioRandSeed) since yapio_pick_io_size() needs it before this point.
+ * It persists the base seed yapio_seed_rng() establishes so
  * yapio_reseed_for_phase() can re-apply the exact same value before every
  * test phase, rather than recomputing it -- recomputing would drift
  * phase-to-phase in the unseeded time()-based fallback if a phase takes
  * any measurable wall-clock time.
  */
-static unsigned int yapioEffectiveBaseSeed;
 
 /* Seed libc's PRNG, once early in main() and again before every test
  * phase (see yapio_reseed_for_phase()), so every rand() call in this
@@ -2528,6 +2713,8 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         qs->ynqs_total_blocks = ytc->ytc_num_ops_expected;
         qs->ynqs_target       = ytc->ytc_num_ops_expected;
         qs->ynqs_blk_sz       = ytg->ytg_blk_sz;
+        qs->ynqs_io_size_min  = ytg->ytg_io_size_min;
+        qs->ynqs_io_size_random = ytg->ytg_io_size_random;
         qs->ynqs_is_read      = ytc->ytc_read;
         qs->ynqs_ytc          = ytc;
 
