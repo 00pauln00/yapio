@@ -355,6 +355,15 @@ typedef struct yapio_test_context
     bool                     ytc_stonewalled;
     int                      ytc_num_ops_expected;
     int                      ytc_num_ops_completed_before_stonewall;
+    /* Actual bytes this rank transferred this phase -- tracked directly
+     * from each op's real length rather than assumed from a uniform
+     * blk_sz, since -x mode makes op size vary per block. See
+     * yapio_gather_barrier_stats() for how it becomes ytc_total_bytes_all_ranks
+     * (leader-only, after MPI_Gather) and yapio_display_result() for where
+     * that total drives the reported bandwidth.
+     */
+    size_t                   ytc_bytes_transferred;
+    size_t                   ytc_total_bytes_all_ranks; /* leader-only */
     enum yapio_patterns      ytc_io_pattern;       //IO pattern to be employed
     int                      ytc_test_num;
     enum yapio_test_ctx_run  ytc_run_status;
@@ -614,6 +623,14 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
         if (vrc && !state->ynqs_error)
             state->ynqs_error = vrc;
     }
+
+    /* slot->yns_iov.iov_len is this op's *actual* transfer length -- may be
+     * less than the queue's nominal blk_sz (vdev-tail clamp, or -x mode's
+     * per-block draw). Bandwidth reporting needs the real total, not an
+     * assumed uniform size -- see yapio_display_result().
+     */
+    if (rc >= 0)
+        state->ynqs_ytc->ytc_bytes_transferred += slot->yns_iov.iov_len;
 
     slot->yns_running = false;
     CIRCLEQ_REMOVE(&state->ynqs_running, slot, yns_lentry);
@@ -2766,6 +2783,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         qs->ynqs_ytc          = ytc;
 
         ytc->ytc_num_ops_completed_before_stonewall = 0;
+        ytc->ytc_bytes_transferred = 0;
 
         /* Wire up per-slot IO buffers and populate the idle queue */
         for (size_t i = 0; i < yapioNiovaQueueDepth; i++)
@@ -2815,6 +2833,7 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
                                ? ytc->ytc_num_ops_expected / 10 : 1;
 
     int j;
+    ytc->ytc_bytes_transferred = 0;
     for (j = 0, ytc->ytc_num_ops_completed_before_stonewall = 0;
          j < ytc->ytc_num_ops_expected;
          j++, ytc->ytc_num_ops_completed_before_stonewall++)
@@ -2887,6 +2906,8 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
             rc = -errno;
             break;
         }
+
+        ytc->ytc_bytes_transferred += (size_t)io_bytes;
 
         if (ytc->ytc_read && yapioVerifyRead)
         {
@@ -3478,6 +3499,7 @@ typedef struct yapio_per_rank_result
 {
     bool          yprr_stonewalled;
     int           yprr_num_ops_completed;
+    size_t        yprr_bytes_transferred;
     yapio_timer_t yprr_barrier_wait;
 } yapio_per_rank_result_t;
 
@@ -3513,6 +3535,7 @@ yapio_gather_barrier_stats(yapio_test_ctx_t *ytc, bool leader_rank)
     yapio_per_rank_result_t yprr =
         {.yprr_stonewalled = ytc->ytc_stonewalled,
          .yprr_num_ops_completed = ytc->ytc_num_ops_completed_before_stonewall,
+         .yprr_bytes_transferred = ytc->ytc_bytes_transferred,
          .yprr_barrier_wait = ytc->ytc_barrier_wait[0]};
 
     if (barrier_global_results)
@@ -3542,6 +3565,7 @@ yapio_gather_barrier_stats(yapio_test_ctx_t *ytc, bool leader_rank)
     if (barrier_global_results)
     {
         ssize_t nblks_written_before_stonewalling = 0;
+        ytc->ytc_total_bytes_all_ranks = 0;
         int i;
         for (i = 0; i < nranks; i++)
         {
@@ -3555,6 +3579,14 @@ yapio_gather_barrier_stats(yapio_test_ctx_t *ytc, bool leader_rank)
                 barrier_global_results[YAPIO_BARRIER_STATS_MAX] = bwait;
                 *barrier_max_rank = i;
             }
+
+            /* Real total bytes actually transferred across all ranks this
+             * phase -- see yapio_display_result(), which uses this instead
+             * of assuming every op moved a uniform blk_sz (wrong in -x
+             * mode, where op size varies per block).
+             */
+            ytc->ytc_total_bytes_all_ranks +=
+                all_results[i].yprr_bytes_transferred;
 
             /* Check if any ranks have been stonewalled.  If so, then adjust
              * the leaders ytc stats to reflect this.
@@ -3643,15 +3675,16 @@ static void
 yapio_display_result(const yapio_test_ctx_t *ytc, yapio_test_group_t *ytg)
 {
     const yapio_timer_t *test_duration = &ytc->ytc_test_duration;
-    const int nranks = ytg->ytg_num_ranks;
-    const size_t blksz = ytg->ytg_blk_sz;
-    const size_t nblks_per_rank =
-        ytc->ytc_stonewalled ?
-        (size_t)ytc->ytc_num_ops_completed_before_stonewall :
-        ytg->ytg_num_blks_per_rank;
 
+    /* ytc_total_bytes_all_ranks is the real sum of bytes each rank actually
+     * transferred this phase (see yapio_gather_barrier_stats()), not an
+     * estimate from a uniform blk_sz. The old "nranks * nblks * blk_sz"
+     * formula assumed every op moved exactly blk_sz bytes, which -x mode
+     * breaks -- op size varies per block there, so that estimate would
+     * overstate bandwidth using the range's upper bound.
+     */
     float bandwidth =
-        (float)(((float)nranks * nblks_per_rank * blksz) /
+        (float)((float)ytc->ytc_total_bytes_all_ranks /
                 yapio_timer_to_float(test_duration));
 
     char *unit_str;
