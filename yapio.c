@@ -164,6 +164,15 @@ static enum yapio_io_modes yapioModeCurrent = YAPIO_IO_MODE_DEFAULT;
 REGISTRY_ENTRY_FILE_GENERATE;
 
 #define YAPIO_NIOVA_BLOCK_SIZE 4096
+
+/* Smallest possible erasure-chunk fat-vblk unit (MFVE2_ECFVBLK_32k in
+ * niova-block's metablock2.h).  Any I/O shorter than this can never fill
+ * even a single fvblk of any stripe, on any EC geometry, so it is
+ * *guaranteed* to be handled as a replicated ECRE write with no ECE
+ * component at all — used only for the -x mode size-distribution summary
+ * below, not for classifying any individual write with certainty.
+ */
+#define YAPIO_MIN_ECHUNK_FVBLK_BYTES 32768
 /* 64 GiB — mirrors NIOVA_DEFAULT_FILE_SIZE from niova_block_common.h */
 #define YAPIO_NIOVA_DEFAULT_FILE_SIZE ((size_t)1 << 36)
 
@@ -525,6 +534,20 @@ typedef struct {
     size_t                        ynqs_blk_sz;
     size_t                        ynqs_io_size_min;  /* 0 unless -x mode    */
     bool                          ynqs_io_size_random;
+
+    /* -x mode observability: per-phase stats on the actual submitted sizes,
+     * so a run can be checked for real size variation on this vdev without
+     * needing -d 3's per-op trace (see the YAPIO_LL_DEBUG log_msg() in
+     * yapio_niova_queue_work_cb()).  Reset every yapio_perform_io() call
+     * (the whole struct is memset there); this summary is printed
+     * unconditionally at the end of the phase — see yapio_perform_io().
+     */
+    size_t                        ynqs_io_size_min_seen;
+    size_t                        ynqs_io_size_max_seen;
+    size_t                        ynqs_io_size_sum;
+    int                           ynqs_io_size_cnt;
+    int                           ynqs_io_size_below_min_fvblk_cnt;
+
     bool                          ynqs_is_read;
     bool                          ynqs_ready;      /* main thread sets true to start  */
     yapio_test_ctx_t             *ynqs_ytc;        /* for stonewall + completed count */
@@ -757,6 +780,27 @@ yapio_niova_queue_work_cb(void *arg)
                     yapio_niova_signal_done(state);
                 continue;
             }
+        }
+
+        if (state->ynqs_io_size_random)
+        {
+            if (state->ynqs_io_size_cnt == 0 ||
+                io_len < state->ynqs_io_size_min_seen)
+                state->ynqs_io_size_min_seen = io_len;
+            if (io_len > state->ynqs_io_size_max_seen)
+                state->ynqs_io_size_max_seen = io_len;
+            state->ynqs_io_size_sum += io_len;
+            state->ynqs_io_size_cnt++;
+            if (io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES)
+                state->ynqs_io_size_below_min_fvblk_cnt++;
+
+            log_msg(YAPIO_LL_DEBUG,
+                    "niova %s x-mode j=%d blk=%lu off=%lld io_len=%zu%s",
+                    state->ynqs_is_read ? "READ" : "WRITE",
+                    state->ynqs_next_j - 1, (unsigned long)md->ybm_blk_number,
+                    (long long)off, io_len,
+                    io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES ?
+                    " (< min fvblk, guaranteed ECRE-only)" : "");
         }
 
         yapio_niova_slot_t *slot = CIRCLEQ_FIRST(&state->ynqs_idle);
@@ -1248,7 +1292,10 @@ yapio_print_help(int exit_val)
                 "\t    vdev and per block, so a single vdev's writes mix\n"
                 "\t    small unaligned I/Os (ECRE-only) with large\n"
                 "\t    stripe-aligned I/Os (ECE) and everything between.\n"
-                "\t    Pinned by -r like the rest of the PRNG state.\n"
+                "\t    Pinned by -r like the rest of the PRNG state. A\n"
+                "\t    compact min/max/avg size summary per rank is always\n"
+                "\t    printed at the end of each phase; pass -d 3 for a\n"
+                "\t    per-op trace of every block's offset and size.\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
@@ -2743,6 +2790,18 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         pthread_mutex_unlock(&qs->ynqs_done_mutex);
 
         rc = qs->ynqs_error;
+
+        if (qs->ynqs_io_size_random && qs->ynqs_io_size_cnt > 0)
+            fprintf(stderr,
+                    "[rank %d] -x size summary (%s, %d ops): "
+                    "min=%zu max=%zu avg=%zu bytes; "
+                    "%d/%d ops < %d bytes (guaranteed ECRE-only)\n",
+                    yapioMyRank, ytc->ytc_read ? "read" : "write",
+                    qs->ynqs_io_size_cnt,
+                    qs->ynqs_io_size_min_seen, qs->ynqs_io_size_max_seen,
+                    qs->ynqs_io_size_sum / (size_t)qs->ynqs_io_size_cnt,
+                    qs->ynqs_io_size_below_min_fvblk_cnt, qs->ynqs_io_size_cnt,
+                    YAPIO_MIN_ECHUNK_FVBLK_BYTES);
 
         pthread_mutex_destroy(&qs->ynqs_done_mutex);
         pthread_cond_destroy(&qs->ynqs_done_cond);
