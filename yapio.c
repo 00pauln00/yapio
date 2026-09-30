@@ -2566,6 +2566,48 @@ yapio_source_md_update_writer_rank(size_t source_md_idx, int new_writer_rank)
     yapioSourceBlkMd[source_md_idx].ybm_not_hole = 1;
 }
 
+#ifdef YAPIO_NIOVA
+/* yapio_niova_blk_number_to_source_idx - inverse of the blk_num assignment
+ * in yapio_initialize_source_md_buffer(), needed because
+ * yapio_blk_md_randomize() permutes *copies* of yapioSourceBlkMd and never
+ * writes back to it -- callers that need to update the persistent source
+ * entry for a given (already shuffled) md[i] must recover which original
+ * index it came from.  See yapio_test_context_setup_local()'s RANDOM
+ * branch, the only caller.
+ */
+static size_t
+yapio_niova_blk_number_to_source_idx(const yapio_test_group_t *ytg,
+                                     size_t blk_number)
+{
+    if (yapioNiovaVdevSizeBytes > 0 && ytg->ytg_num_blks_per_rank > 0)
+    {
+        size_t vdev_total_blks = yapioNiovaVdevSizeBytes / ytg->ytg_blk_sz;
+        if (vdev_total_blks < 1)
+            vdev_total_blks = 1;
+
+        if (ytg->ytg_num_blks_per_rank <= vdev_total_blks)
+        {
+            size_t stride = vdev_total_blks / ytg->ytg_num_blks_per_rank;
+            return stride ? blk_number / stride : blk_number;
+        }
+
+        /* Wrap case (see yapio_initialize_source_md_buffer()): multiple
+         * original indices alias the same blk_number. blk_number itself
+         * is always one valid original index (i < vdev_total_blks maps to
+         * itself), which is the best we can do without tracking every
+         * alias -- an inherent limitation of requesting more ops than
+         * address slots exist at this stride.
+         */
+        return blk_number;
+    }
+
+    /* No -z spreading: blk_num == i already (niova mode always sets
+     * fpp=true in yapio_initialize_source_md_buffer()).
+     */
+    return blk_number;
+}
+#endif
+
 static unsigned long long
 yapio_get_content_word(const yapio_blk_md_t *md, size_t word_num)
 {
@@ -3176,6 +3218,40 @@ yapio_test_context_setup_local(yapio_test_ctx_t *ytc)
                                     ytg->ytg_num_blks_per_rank, true);
 
         select_holes(ytg->ytg_num_blks_per_rank, ytc->ytc_sparse_io, md);
+
+#ifdef YAPIO_NIOVA
+        /* yapio_blk_md_randomize()/select_holes() only touch the per-context
+         * copy 'md' above, never yapioSourceBlkMd -- unlike the sequential
+         * path, nothing here records which blocks a write actually
+         * touched. Left unfixed, ybm_not_hole never becomes true for
+         * RANDOM pattern in niova mode, so
+         * yapio_verify_contents_of_io_buffer()'s `if (!md->ybm_not_hole)
+         * return 0` silently skips content verification on every read --
+         * every block still looks like an untouched hole. Mirror what the
+         * sequential path does: record the write, or mark not-hole on a
+         * read, against the *source* entry so a later phase (which
+         * re-derives its own shuffled copy from yapioSourceBlkMd) sees it.
+         */
+        if (yapioModeCurrent == YAPIO_IO_MODE_NIOVA)
+        {
+            for (size_t i = 0; i < ytg->ytg_num_blks_per_rank; i++)
+            {
+                if (md[i].ybm_skip_io)
+                    continue;
+
+                size_t source_idx = yapio_niova_blk_number_to_source_idx(
+                    ytg, md[i].ybm_blk_number);
+                if (source_idx >= ytg->ytg_num_blks_per_rank)
+                    continue; /* defensive: should not happen */
+
+                if (!ytc->ytc_read)
+                    yapio_source_md_update_writer_rank(source_idx,
+                                                       yapioMyRank);
+                else
+                    yapioSourceBlkMd[source_idx].ybm_not_hole = 1;
+            }
+        }
+#endif
     }
 
     return rc;
