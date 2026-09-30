@@ -1957,24 +1957,15 @@ yapio_getopts(int argc, char **argv)
                 yapio_print_help(YAPIO_EXIT_ERR);
             }
 
-            /* Worst-case per-rank footprint uses the range's upper bound
-             * since that's what ytg_blk_sz (the address-space stride) is
-             * about to become -- the generic check below this ifdef block
-             * only ever looks at the global yapioBlkSz, which -x never
-             * touches, so it would silently miss an oversized -x range.
+            /* No YAPIO_MAX_SIZE_PER_PE-style cap here: that constant bounds
+             * a local POSIX file/mmap size, which niova mode never
+             * allocates. The real constraint in niova mode is the vdev's
+             * actual capacity, which the address-spreading logic in
+             * yapio_initialize_source_md_buffer() already handles (it
+             * wraps addresses instead of overflowing when -N exceeds what
+             * fits at this stride) -- -N and the address range are meant
+             * to be independent, per that function's comment.
              */
-            size_t per_rank_bytes =
-                yapioTestGroups[i].ytg_num_blks_per_rank * yapioIoSizeMax;
-            if (per_rank_bytes > YAPIO_MAX_SIZE_PER_PE)
-            {
-                log_msg(YAPIO_LL_FATAL,
-                        "-x: per-rank data size (%zu, using max=%zu) "
-                        "exceeds max (%llu) for test group %d",
-                        per_rank_bytes, yapioIoSizeMax,
-                        YAPIO_MAX_SIZE_PER_PE, i);
-                yapio_print_help(YAPIO_EXIT_ERR);
-            }
-
             yapioTestGroups[i].ytg_blk_sz = yapioIoSizeMax;
             yapioTestGroups[i].ytg_io_size_min = yapioIoSizeMin;
             yapioTestGroups[i].ytg_io_size_random = true;
@@ -2534,9 +2525,23 @@ yapio_initialize_source_md_buffer(const yapio_test_group_t *ytg)
             ytg->ytg_num_blks_per_rank > 0)
         {
             size_t vdev_total_blks = yapioNiovaVdevSizeBytes / ytg->ytg_blk_sz;
-            size_t stride = vdev_total_blks / ytg->ytg_num_blks_per_rank;
-            if (stride < 1) stride = 1;
-            blk_num = i * stride;
+            if (vdev_total_blks < 1)
+                vdev_total_blks = 1; /* degenerate: blk_sz > vdev size */
+
+            /* -N and the address range are independent by design (see
+             * comment above), so -N exceeding what fits at this stride
+             * must wrap into the valid range rather than walk off the end
+             * of the vdev.
+             */
+            if (ytg->ytg_num_blks_per_rank <= vdev_total_blks)
+            {
+                size_t stride = vdev_total_blks / ytg->ytg_num_blks_per_rank;
+                blk_num = i * stride;
+            }
+            else
+            {
+                blk_num = i % vdev_total_blks;
+            }
         }
 #endif
         yapioSourceBlkMd[i].ybm_blk_number = blk_num;
