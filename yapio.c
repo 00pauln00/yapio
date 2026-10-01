@@ -45,7 +45,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:r:x:"
+#define YAPIO_OPTS "b:N:hd:i:m:t:nPD:sV:S:v:C:z:Wq:r:x:p:"
 
 #define YAPIO_DEF_NBLKS_PER_PE     1000
 #define YAPIO_DEF_BLK_SIZE         4096
@@ -98,6 +98,15 @@ static bool        yapioBlkSzExplicit  = false; /* true once -b is parsed */
 static size_t      yapioIoSizeMin          = 0;
 static size_t      yapioIoSizeMax          = 0;
 static bool        yapioIoSizeRandomEnabled = false;
+/* Set via -p <write%>:<read%> (niova mode only) -- enables the mixed
+ * interleaved random read/write mode (-t recipe token 'Z'). Requires -x
+ * (op size range) and -z (working-set bound) alongside it. See
+ * yapio_mixed_ops_setup() / yapio_mixed_hash() for the generator and
+ * yapio_niova_queue_work_cb()/yapio_niova_completion_cb()'s
+ * ynqs_mixed_mode branches for execution.
+ */
+static int         yapioMixedWritePct      = -1;    /* 0-100; -1 = unset */
+static bool        yapioMixedModeEnabled   = false;
 static unsigned int yapioRandSeed         = 0;     /* set via -r <seed>       */
 static bool          yapioRandSeedExplicit = false; /* true once -r is parsed */
 /* Set by yapio_seed_rng(); see the comment above that function for why this
@@ -351,7 +360,10 @@ typedef struct yapio_test_context
                              ytc_backwards:1,
                              ytc_remote_locality:1,
                              ytc_read:1,
-                             ytc_no_fsync:1;
+                             ytc_no_fsync:1,
+                             ytc_mixed_rw:1; /* -t Z + -p: interleaved
+                                              * random read/write, see
+                                              * yapio_mixed_ops_setup() */
     bool                     ytc_stonewalled;
     int                      ytc_num_ops_expected;
     int                      ytc_num_ops_completed_before_stonewall;
@@ -521,6 +533,11 @@ typedef struct yapio_niova_slot {
     struct iovec              yns_iov;    /* full-block iov, set once per submission */
     char                     *yns_buf;   /* per-slot buffer (blk_sz bytes)          */
     const yapio_blk_md_t     *yns_md;   /* block metadata (read-only)              */
+    /* Mixed r/w mode (-p) only: the yapio_mixed_op_t* this submission came
+     * from (void* to avoid a forward declaration -- yapio_mixed_op_t is
+     * defined later in the file, alongside the rest of mixed mode).
+     */
+    const void                *yns_mixed_op;
     bool                      yns_running;
     CIRCLEQ_ENTRY(yapio_niova_slot) yns_lentry;
 } yapio_niova_slot_t;
@@ -561,6 +578,22 @@ typedef struct {
     bool                          ynqs_ready;      /* main thread sets true to start  */
     yapio_test_ctx_t             *ynqs_ytc;        /* for stonewall + completed count */
 
+    /* Mixed r/w mode (-p): ynqs_mixed_mode true means ynqs_next_j/
+     * ynqs_total_blocks index into ynqs_mixed_ops (a yapio_mixed_op_t
+     * array, void* for the same forward-declaration reason as
+     * yns_mixed_op above) instead of ynqs_md_array, and every op has its
+     * own independent type/offset/size instead of one fixed ynqs_is_read/
+     * ynqs_blk_sz for the whole phase. ynqs_num_ioh is forced to 1 by the
+     * caller (yapio_perform_io()) for this mode -- see the correctness
+     * reasoning on queue depth in yapio_mixed_ops_setup()'s header comment.
+     */
+    bool                          ynqs_mixed_mode;
+    const void                   *ynqs_mixed_ops;
+    int                           ynqs_mixed_write_cnt;
+    int                           ynqs_mixed_read_cnt;
+    int                           ynqs_mixed_hole_cnt;
+    int                           ynqs_mixed_mismatch_cnt;
+
     /* Results — written on iopm thread, read by main thread after done */
     int                           ynqs_ncompleted;
     int                           ynqs_error;
@@ -579,6 +612,23 @@ static int   yapio_verify_contents_of_io_buffer(const char *buf, size_t buf_len,
 static off_t yapio_get_rw_offset(const yapio_blk_md_t *md, size_t blk_sz);
 static void  yapio_apply_contents_to_io_buffer(char *buf, size_t buf_len,
                                                 const yapio_blk_md_t *md);
+
+/* Forward declarations: mixed r/w mode (-p) is implemented later in the
+ * file (near yapio_mixed_hash()), but yapio_niova_completion_cb() and
+ * yapio_niova_queue_work_cb() below need to call into it. Kept as
+ * const void* (not yapio_mixed_op_t*) so these prototypes don't need that
+ * struct's full definition visible yet.
+ */
+static const void *yapio_mixed_op_at(const void *ops, int index);
+static bool yapio_mixed_op_is_write(const void *op);
+static uint32_t yapio_mixed_op_generation(const void *op);
+static void yapio_mixed_get_op_params(const void *op, off_t *off_out,
+                                      size_t *io_len_out);
+static void yapio_mixed_fill_slot_if_write(char *buf, const void *op,
+                                           bool is_read);
+static void yapio_mixed_completion_update(yapio_niova_queue_state_t *state,
+                                          yapio_niova_slot_t *slot,
+                                          const void *op, bool is_read);
 
 /* Signal the MPI main thread that all IO for this test context is done.
  * Called from the iopm worker thread (under no lock).
@@ -602,12 +652,20 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
     yapio_niova_slot_t        *slot  = (yapio_niova_slot_t *)arg;
     yapio_niova_queue_state_t *state = &yapioQueueState;
 
+    const void *mixed_op = state->ynqs_mixed_mode ? slot->yns_mixed_op : NULL;
+    bool is_read = mixed_op ? !yapio_mixed_op_is_write(mixed_op) :
+        state->ynqs_is_read;
+
     if (rc < 0)
     {
         log_msg(YAPIO_LL_ERROR, "niova %s cb rc=%zd",
-                state->ynqs_is_read ? "READ" : "WRITE", rc);
+                is_read ? "READ" : "WRITE", rc);
         if (!state->ynqs_error)
             state->ynqs_error = (int)rc;
+    }
+    else if (mixed_op)
+    {
+        yapio_mixed_completion_update(state, slot, mixed_op, is_read);
     }
     else if (state->ynqs_is_read && yapioVerifyRead && !state->ynqs_error)
     {
@@ -640,7 +698,7 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
     state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
 
     log_msg(YAPIO_LL_DEBUG, "niova %s done %d/%d err=%d",
-            state->ynqs_is_read ? "READ" : "WRITE",
+            is_read ? "READ" : "WRITE",
             state->ynqs_ncompleted, state->ynqs_target,
             state->ynqs_error);
 
@@ -669,24 +727,364 @@ yapio_niova_completion_cb(void *arg, ssize_t rc)
  * vdev-file's rank-to-vdev mapping is stable across runs, (rank, blk_num)
  * uniquely and reproducibly identifies a byte range on a specific vdev.
  */
+/* splitmix64 mix step — cheap, well-distributed, no library dependency.
+ * Shared by yapio_pick_io_size() (keyed on blk_number) and the mixed r/w
+ * mode's yapio_mixed_hash() (keyed on op_index + field) below -- both need
+ * strong avalanche behaviour so that *adjacent* keys (consecutive block
+ * numbers, consecutive op indices, or -- critically for mixed mode, see
+ * yapio_mixed_hash() -- consecutive rank numbers) don't produce correlated
+ * output the way a plain LCG rand() can.
+ */
+static uint64_t
+yapio_splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+/* yapio_map_hash_to_size - map an already-mixed hash value onto
+ * [min_sz, max_sz], rounded to YAPIO_NIOVA_BLOCK_SIZE (4K) steps.
+ */
 static size_t
-yapio_pick_io_size(size_t blk_number, size_t min_sz, size_t max_sz)
+yapio_map_hash_to_size(uint64_t hashval, size_t min_sz, size_t max_sz)
 {
     if (min_sz >= max_sz)
         return max_sz;
 
+    size_t nsteps = (max_sz - min_sz) / YAPIO_NIOVA_BLOCK_SIZE + 1;
+
+    return min_sz + (size_t)(hashval % nsteps) * YAPIO_NIOVA_BLOCK_SIZE;
+}
+
+static size_t
+yapio_pick_io_size(size_t blk_number, size_t min_sz, size_t max_sz)
+{
     uint64_t x = (uint64_t)yapioEffectiveBaseSeed ^
                  ((uint64_t)yapioMyRank << 32) ^ (uint64_t)blk_number;
 
-    /* splitmix64 mix step — cheap, well-distributed, no library dependency. */
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    x =  x ^ (x >> 31);
+    return yapio_map_hash_to_size(yapio_splitmix64(x), min_sz, max_sz);
+}
 
-    size_t nsteps = (max_sz - min_sz) / YAPIO_NIOVA_BLOCK_SIZE + 1;
+/* yapio_mixed_hash - deterministic, domain-separated draw for the -p mixed
+ * r/w mode: one independent, well-mixed value per (rank, op_index, field),
+ * so that op type / offset / size for the same op don't move in lockstep
+ * with each other, consecutive ops within a rank are statistically
+ * independent, AND -- the point raised when designing this -- different
+ * ranks are independent of EACH OTHER even though their seeds
+ * (yapioEffectiveBaseSeed + rank, see yapio_seed_rng()) differ by as little
+ * as 1. A plain rand()-stream approach keyed off that seed can correlate
+ * for adjacent ranks after a %-reduction (exactly what op-type/size
+ * selection does); folding `rank` through its own splitmix64 round before
+ * combining avoids that.
+ */
+static uint64_t
+yapio_mixed_hash(uint64_t op_index, uint32_t field_tag)
+{
+    uint64_t x = (uint64_t)yapioEffectiveBaseSeed;
+    x ^= yapio_splitmix64((uint64_t)yapioMyRank * 0x9E3779B97F4A7C15ULL);
+    x ^= yapio_splitmix64(op_index + 1);
+    x ^= yapio_splitmix64((uint64_t)field_tag * 0xBF58476D1CE4E5B9ULL);
 
-    return min_sz + (size_t)(x % nsteps) * YAPIO_NIOVA_BLOCK_SIZE;
+    return yapio_splitmix64(x);
+}
+
+enum yapio_mixed_hash_field
+{
+    YAPIO_MIXED_FIELD_TYPE   = 1,
+    YAPIO_MIXED_FIELD_OFFSET = 2,
+    YAPIO_MIXED_FIELD_SIZE   = 3,
+};
+
+typedef struct yapio_mixed_op
+{
+    uint64_t ymo_vblk_start;
+    uint32_t ymo_nvblks;
+    uint32_t ymo_generation; /* 0 for reads (unused) */
+    bool     ymo_is_write;
+} yapio_mixed_op_t;
+
+/* Mixed r/w mode (-p) per-rank state. One rank = one vdev = one process,
+ * so plain globals suffice -- same convention as yapioSourceBlkMd etc.
+ */
+static yapio_mixed_op_t *yapioMixedOps           = NULL;
+static uint64_t          yapioMixedTrackedVblks  = 0; /* working set / 4K */
+static uint32_t          yapioMixedNextGeneration = 1; /* 0 = hole sentinel */
+
+/* Exactly one of these is allocated, chosen by yapioVerifyRead (-V
+ * disables it): verification on (default) -> per-vblk uint16_t generation
+ * array (content-verified reads, ~2 bytes/vblk); -V given -> a 1-bit
+ * hole/not-hole bitmap (no content check, ~32x cheaper). See
+ * yapio_niova_setup_clients() for sizing/allocation/diagnostics.
+ */
+static uint16_t *yapioMixedGenTrack   = NULL;
+static uint8_t  *yapioMixedHoleBitmap = NULL;
+
+static inline bool
+yapio_mixed_bitmap_test(uint64_t vblk)
+{
+    return (yapioMixedHoleBitmap[vblk >> 3] >> (vblk & 7)) & 1;
+}
+
+static inline void
+yapio_mixed_bitmap_set(uint64_t vblk)
+{
+    yapioMixedHoleBitmap[vblk >> 3] |= (uint8_t)(1U << (vblk & 7));
+}
+
+/* yapio_mixed_truncate_generation - yapioMixedGenTrack stores uint16_t
+ * (2 bytes/vblk) while yapioMixedNextGeneration is an unbounded uint32_t
+ * counter, so a vblk written more than 65535 times would alias if we
+ * stored the raw value. Reduce to [1,65535] (0 stays reserved as the hole
+ * sentinel) *idempotently* -- truncate(truncate(x)) == truncate(x) -- so
+ * it gives the same result whether called on the raw counter value (at
+ * write-content-generation time) or on an already-stored, already-
+ * truncated uint16_t promoted back to uint32_t (at read-verification
+ * time). That's what keeps the two sides consistent; see
+ * yapio_mixed_content_word() and yapio_mixed_completion_update().
+ */
+static inline uint32_t
+yapio_mixed_truncate_generation(uint32_t generation)
+{
+    return 1 + ((generation - 1) % 65535);
+}
+
+/* yapio_mixed_content_word - content formula for mixed mode, keyed on
+ * (generation, vblk) instead of (blk_number, writer_rank) like
+ * yapio_get_content_word() -- generation identifies *which write* last
+ * touched this vblk (see yapio_mixed_hash()'s comment on why overlapping
+ * writes need this instead of a static per-address identity); vblk keeps
+ * different addresses from ever producing identical content.
+ */
+static unsigned long long
+yapio_mixed_content_word(uint32_t generation, uint64_t vblk, size_t word_num)
+{
+    uint32_t g = yapio_mixed_truncate_generation(generation);
+
+    return yapio_get_blk_magic((size_t)g) +
+           (unsigned long long)yapioMyRank + g + vblk + word_num;
+}
+
+static void
+yapio_mixed_fill_write_buffer(char *buf, uint64_t vblk_start, uint32_t nvblks,
+                              uint32_t generation)
+{
+    unsigned long long *words = (unsigned long long *)buf;
+    const size_t words_per_vblk =
+        YAPIO_NIOVA_BLOCK_SIZE / sizeof(unsigned long long);
+
+    for (uint32_t v = 0; v < nvblks; v++)
+    {
+        uint64_t vblk = vblk_start + v;
+        unsigned long long *vblk_words = words + (size_t)v * words_per_vblk;
+
+        for (size_t w = 0; w < words_per_vblk; w++)
+            vblk_words[w] = yapio_mixed_content_word(generation, vblk, w);
+    }
+}
+
+/* yapio_mixed_verify_read_buffer - split a (possibly multi-vblk) read into
+ * its constituent 4K chunks and check each against *its own* recorded
+ * write history -- a single read can span bytes from different prior
+ * writes (e.g. a 128K write partially overwritten by a later 4K write),
+ * so whole-buffer verification would be wrong. Bitmap mode only tallies
+ * holes (no content check, by construction of -V). Returns 0 if no
+ * mismatches were found (or bitmap mode), -1 if any mismatch was seen.
+ */
+static int
+yapio_mixed_verify_read_buffer(const char *buf, uint64_t vblk_start,
+                               uint32_t nvblks, int *hole_cnt,
+                               int *mismatch_cnt)
+{
+    const unsigned long long *words = (const unsigned long long *)buf;
+    const size_t words_per_vblk =
+        YAPIO_NIOVA_BLOCK_SIZE / sizeof(unsigned long long);
+
+    for (uint32_t v = 0; v < nvblks; v++)
+    {
+        uint64_t vblk = vblk_start + v;
+
+        if (yapioMixedHoleBitmap)
+        {
+            if (!yapio_mixed_bitmap_test(vblk))
+                (*hole_cnt)++;
+            continue;
+        }
+
+        uint16_t generation = yapioMixedGenTrack[vblk];
+        if (generation == 0)
+        {
+            (*hole_cnt)++;
+            continue;
+        }
+
+        const unsigned long long *vblk_words =
+            words + (size_t)v * words_per_vblk;
+        for (size_t w = 0; w < words_per_vblk; w++)
+        {
+            unsigned long long expected =
+                yapio_mixed_content_word(generation, vblk, w);
+            if (vblk_words[w] != expected)
+            {
+                log_msg(YAPIO_LL_ERROR,
+                        "mixed-mode verify fail vblk=%lu gen=%u word=%zu "
+                        "got=%llx expected=%llx",
+                        (unsigned long)vblk, (unsigned)generation, w,
+                        vblk_words[w], expected);
+                (*mismatch_cnt)++;
+                break;
+            }
+        }
+    }
+
+    return *mismatch_cnt ? -1 : 0;
+}
+
+/* yapio_mixed_ops_setup - pre-generate this rank's full mixed r/w op
+ * sequence (type/offset/size via yapio_mixed_hash(), write generations via
+ * a simple monotonic counter) and (re)allocate yapioMixedOps to hold it.
+ * See yapio_test_context_setup(), the only caller.
+ */
+static int
+yapio_mixed_ops_setup(yapio_test_ctx_t *ytc)
+{
+    yapio_test_group_t *ytg = ytc->ytc_group;
+    int num_ops = (int)ytg->ytg_num_blks_per_rank;
+
+    if (yapioMixedOps)
+        YAPIO_FREE(yapioMixedOps);
+
+    yapioMixedOps = YAPIO_CALLOC(num_ops, sizeof(yapio_mixed_op_t));
+    if (!yapioMixedOps)
+        return -ENOMEM;
+
+    for (int i = 0; i < num_ops; i++)
+    {
+        yapio_mixed_op_t *op = &yapioMixedOps[i];
+
+        uint64_t type_hash =
+            yapio_mixed_hash((uint64_t)i, YAPIO_MIXED_FIELD_TYPE);
+        op->ymo_is_write = (type_hash % 100) < (uint64_t)yapioMixedWritePct;
+
+        size_t size_bytes = yapio_map_hash_to_size(
+            yapio_mixed_hash((uint64_t)i, YAPIO_MIXED_FIELD_SIZE),
+            yapioIoSizeMin, yapioIoSizeMax);
+
+        uint64_t nvblks64 = size_bytes / YAPIO_NIOVA_BLOCK_SIZE;
+        if (nvblks64 < 1)
+            nvblks64 = 1;
+        if (nvblks64 > yapioMixedTrackedVblks)
+            nvblks64 = yapioMixedTrackedVblks;
+        op->ymo_nvblks = (uint32_t)nvblks64;
+
+        uint64_t max_start = yapioMixedTrackedVblks - nvblks64; /* inclusive */
+        uint64_t offset_hash =
+            yapio_mixed_hash((uint64_t)i, YAPIO_MIXED_FIELD_OFFSET);
+        op->ymo_vblk_start = max_start > 0 ?
+            offset_hash % (max_start + 1) : 0;
+
+        op->ymo_generation = op->ymo_is_write ? yapioMixedNextGeneration++ : 0;
+    }
+
+    ytc->ytc_num_ops_expected = num_ops;
+
+    return 0;
+}
+
+/* Implementations of the mixed-mode accessors forward-declared earlier
+ * (before yapio_niova_completion_cb()/yapio_niova_queue_work_cb(), which
+ * need to call into these without yapio_mixed_op_t's definition visible
+ * that early in the file).
+ */
+static const void *
+yapio_mixed_op_at(const void *ops, int index)
+{
+    return &((const yapio_mixed_op_t *)ops)[index];
+}
+
+static bool
+yapio_mixed_op_is_write(const void *op)
+{
+    return ((const yapio_mixed_op_t *)op)->ymo_is_write;
+}
+
+static uint32_t
+yapio_mixed_op_generation(const void *op)
+{
+    return ((const yapio_mixed_op_t *)op)->ymo_generation;
+}
+
+static void
+yapio_mixed_get_op_params(const void *op, off_t *off_out, size_t *io_len_out)
+{
+    const yapio_mixed_op_t *mop = (const yapio_mixed_op_t *)op;
+
+    *off_out = (off_t)(mop->ymo_vblk_start * YAPIO_NIOVA_BLOCK_SIZE);
+    *io_len_out = (size_t)mop->ymo_nvblks * YAPIO_NIOVA_BLOCK_SIZE;
+}
+
+static void
+yapio_mixed_fill_slot_if_write(char *buf, const void *op, bool is_read)
+{
+    if (is_read)
+        return;
+
+    const yapio_mixed_op_t *mop = (const yapio_mixed_op_t *)op;
+
+    yapio_mixed_fill_write_buffer(buf, mop->ymo_vblk_start, mop->ymo_nvblks,
+                                  mop->ymo_generation);
+}
+
+/* yapio_mixed_completion_update - called from yapio_niova_completion_cb()
+ * once a mixed-mode op completes successfully (rc >= 0). Writes stamp the
+ * shadow tracker (bitmap or generation array, whichever -V selected);
+ * reads check against it (generation mode) or just tally holes (bitmap
+ * mode, or when -V has disabled verification outright).
+ */
+static void
+yapio_mixed_completion_update(yapio_niova_queue_state_t *state,
+                              yapio_niova_slot_t *slot, const void *op,
+                              bool is_read)
+{
+    const yapio_mixed_op_t *mop = (const yapio_mixed_op_t *)op;
+
+    if (!is_read)
+    {
+        state->ynqs_mixed_write_cnt++;
+
+        if (yapioMixedHoleBitmap)
+        {
+            for (uint32_t v = 0; v < mop->ymo_nvblks; v++)
+                yapio_mixed_bitmap_set(mop->ymo_vblk_start + v);
+        }
+        else
+        {
+            uint16_t g = (uint16_t)
+                yapio_mixed_truncate_generation(mop->ymo_generation);
+            for (uint32_t v = 0; v < mop->ymo_nvblks; v++)
+                yapioMixedGenTrack[mop->ymo_vblk_start + v] = g;
+        }
+
+        return;
+    }
+
+    state->ynqs_mixed_read_cnt++;
+
+    /* yapio_mixed_verify_read_buffer() branches internally on
+     * yapioMixedHoleBitmap vs yapioMixedGenTrack: bitmap mode (-V) only
+     * tallies holes (no content compare), generation mode does both.
+     * Either way there's a useful tally to collect, so always call it.
+     */
+    int hole_cnt = 0, mismatch_cnt = 0;
+    yapio_mixed_verify_read_buffer(slot->yns_buf, mop->ymo_vblk_start,
+                                   mop->ymo_nvblks, &hole_cnt, &mismatch_cnt);
+
+    state->ynqs_mixed_hole_cnt += hole_cnt;
+    state->ynqs_mixed_mismatch_cnt += mismatch_cnt;
+
+    if (mismatch_cnt && !state->ynqs_error)
+        state->ynqs_error = -1;
 }
 
 /* iopm runtime callback — runs on the iopm worker thread on every iteration.
@@ -731,117 +1129,158 @@ yapio_niova_queue_work_cb(void *arg)
         if (CIRCLEQ_EMPTY(&state->ynqs_idle))
             break;
 
-        const yapio_blk_md_t *md = &state->ynqs_md_array[state->ynqs_next_j];
-        state->ynqs_next_j++;
+        const yapio_blk_md_t *md = NULL;
+        const void *mixed_op = NULL;
+        off_t off;
+        size_t io_len;
+        bool is_read;
 
-        /* Skip flagged blocks without consuming a slot */
-        if (md->ybm_skip_io)
+        if (state->ynqs_mixed_mode)
         {
-            state->ynqs_ncompleted++;
-            state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
-            to_submit++; /* allow one more iteration to fill the gap */
-            if (state->ynqs_ncompleted >= state->ynqs_target)
-                yapio_niova_signal_done(state);
-            continue;
+            /* Mixed r/w mode (-p): op sequence is pre-generated (see
+             * yapio_mixed_ops_setup()) -- no per-op skip/clamp/stats logic
+             * needed here, the generator already kept every op in bounds.
+             */
+            mixed_op = yapio_mixed_op_at(state->ynqs_mixed_ops,
+                                        state->ynqs_next_j);
+            state->ynqs_next_j++;
+
+            yapio_mixed_get_op_params(mixed_op, &off, &io_len);
+            is_read = !yapio_mixed_op_is_write(mixed_op);
+
+            log_msg(YAPIO_LL_DEBUG,
+                    "niova %s mixed-mode j=%d off=%lld io_len=%zu gen=%u",
+                    is_read ? "READ" : "WRITE", state->ynqs_next_j - 1,
+                    (long long)off, io_len,
+                    is_read ? 0 : yapio_mixed_op_generation(mixed_op));
         }
-
-        off_t off = yapio_get_rw_offset(md, state->ynqs_blk_sz);
-        if (off < 0)
+        else
         {
-            log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed j=%d",
-                    state->ynqs_next_j - 1);
-            if (!state->ynqs_error)
-                state->ynqs_error = -ERANGE;
-            break;
-        }
+            md = &state->ynqs_md_array[state->ynqs_next_j];
+            state->ynqs_next_j++;
 
-        /* -x mode: draw this block's transfer length independently of the
-         * offset stride (state->ynqs_blk_sz keeps acting as the stride /
-         * buffer-allocation size — see yapioIoSizeMax's comment). Otherwise
-         * unchanged: fixed size, as before.
-         */
-        size_t io_len = state->ynqs_io_size_random ?
-            yapio_pick_io_size(md->ybm_blk_number, state->ynqs_io_size_min,
-                               state->ynqs_blk_sz) :
-            state->ynqs_blk_sz;
-
-        /* Clamp the last block: if the vdev size isn't an exact multiple
-         * of io_len (e.g. -b doesn't evenly divide a CP-reported or -z
-         * vdev size), the final block's [off, off+io_len) range can
-         * extend past the actual device boundary even though 'off' itself
-         * is in range. niova addresses in YAPIO_NIOVA_BLOCK_SIZE (4K)
-         * vblk units, so round the remaining space down to a whole number
-         * of vblks -- if nothing whole is left, there's no valid I/O here
-         * at all; treat it the same as an explicitly-skipped block.
-         */
-        if (yapioNiovaVdevSizeBytes > 0 &&
-            (size_t)off + io_len > yapioNiovaVdevSizeBytes)
-        {
-            size_t remaining = (size_t)off < yapioNiovaVdevSizeBytes ?
-                yapioNiovaVdevSizeBytes - (size_t)off : 0;
-            io_len = (remaining / YAPIO_NIOVA_BLOCK_SIZE) *
-                     YAPIO_NIOVA_BLOCK_SIZE;
-
-            log_msg(YAPIO_LL_WARN,
-                    "clamping j=%d off=%lld blk_sz=%zu -> io_len=%zu "
-                    "(vdev_size=%zu, block would exceed device boundary)",
-                    state->ynqs_next_j - 1, (long long)off,
-                    state->ynqs_blk_sz, io_len, yapioNiovaVdevSizeBytes);
-
-            if (io_len == 0)
+            /* Skip flagged blocks without consuming a slot */
+            if (md->ybm_skip_io)
             {
                 state->ynqs_ncompleted++;
                 state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
-                to_submit++;
+                to_submit++; /* allow one more iteration to fill the gap */
                 if (state->ynqs_ncompleted >= state->ynqs_target)
                     yapio_niova_signal_done(state);
                 continue;
             }
-        }
 
-        if (state->ynqs_io_size_random)
-        {
-            if (state->ynqs_io_size_cnt == 0 ||
-                io_len < state->ynqs_io_size_min_seen)
-                state->ynqs_io_size_min_seen = io_len;
-            if (io_len > state->ynqs_io_size_max_seen)
-                state->ynqs_io_size_max_seen = io_len;
-            state->ynqs_io_size_sum += io_len;
-            state->ynqs_io_size_cnt++;
-            if (io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES)
-                state->ynqs_io_size_below_min_fvblk_cnt++;
+            off = yapio_get_rw_offset(md, state->ynqs_blk_sz);
+            if (off < 0)
+            {
+                log_msg(YAPIO_LL_ERROR, "yapio_get_rw_offset() failed j=%d",
+                        state->ynqs_next_j - 1);
+                if (!state->ynqs_error)
+                    state->ynqs_error = -ERANGE;
+                break;
+            }
 
-            log_msg(YAPIO_LL_DEBUG,
-                    "niova %s x-mode j=%d blk=%lu off=%lld io_len=%zu%s",
-                    state->ynqs_is_read ? "READ" : "WRITE",
-                    state->ynqs_next_j - 1, (unsigned long)md->ybm_blk_number,
-                    (long long)off, io_len,
-                    io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES ?
-                    " (< min fvblk, guaranteed ECRE-only)" : "");
+            /* -x mode: draw this block's transfer length independently of
+             * the offset stride (state->ynqs_blk_sz keeps acting as the
+             * stride / buffer-allocation size — see yapioIoSizeMax's
+             * comment). Otherwise unchanged: fixed size, as before.
+             */
+            io_len = state->ynqs_io_size_random ?
+                yapio_pick_io_size(md->ybm_blk_number,
+                                   state->ynqs_io_size_min,
+                                   state->ynqs_blk_sz) :
+                state->ynqs_blk_sz;
+
+            /* Clamp the last block: if the vdev size isn't an exact
+             * multiple of io_len (e.g. -b doesn't evenly divide a
+             * CP-reported or -z vdev size), the final block's
+             * [off, off+io_len) range can extend past the actual device
+             * boundary even though 'off' itself is in range. niova
+             * addresses in YAPIO_NIOVA_BLOCK_SIZE (4K) vblk units, so
+             * round the remaining space down to a whole number of vblks
+             * -- if nothing whole is left, there's no valid I/O here at
+             * all; treat it the same as an explicitly-skipped block.
+             */
+            if (yapioNiovaVdevSizeBytes > 0 &&
+                (size_t)off + io_len > yapioNiovaVdevSizeBytes)
+            {
+                size_t remaining = (size_t)off < yapioNiovaVdevSizeBytes ?
+                    yapioNiovaVdevSizeBytes - (size_t)off : 0;
+                io_len = (remaining / YAPIO_NIOVA_BLOCK_SIZE) *
+                         YAPIO_NIOVA_BLOCK_SIZE;
+
+                log_msg(YAPIO_LL_WARN,
+                        "clamping j=%d off=%lld blk_sz=%zu -> io_len=%zu "
+                        "(vdev_size=%zu, block would exceed device "
+                        "boundary)",
+                        state->ynqs_next_j - 1, (long long)off,
+                        state->ynqs_blk_sz, io_len, yapioNiovaVdevSizeBytes);
+
+                if (io_len == 0)
+                {
+                    state->ynqs_ncompleted++;
+                    state->ynqs_ytc->ytc_num_ops_completed_before_stonewall++;
+                    to_submit++;
+                    if (state->ynqs_ncompleted >= state->ynqs_target)
+                        yapio_niova_signal_done(state);
+                    continue;
+                }
+            }
+
+            if (state->ynqs_io_size_random)
+            {
+                if (state->ynqs_io_size_cnt == 0 ||
+                    io_len < state->ynqs_io_size_min_seen)
+                    state->ynqs_io_size_min_seen = io_len;
+                if (io_len > state->ynqs_io_size_max_seen)
+                    state->ynqs_io_size_max_seen = io_len;
+                state->ynqs_io_size_sum += io_len;
+                state->ynqs_io_size_cnt++;
+                if (io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES)
+                    state->ynqs_io_size_below_min_fvblk_cnt++;
+
+                log_msg(YAPIO_LL_DEBUG,
+                        "niova %s x-mode j=%d blk=%lu off=%lld io_len=%zu%s",
+                        state->ynqs_is_read ? "READ" : "WRITE",
+                        state->ynqs_next_j - 1,
+                        (unsigned long)md->ybm_blk_number,
+                        (long long)off, io_len,
+                        io_len < YAPIO_MIN_ECHUNK_FVBLK_BYTES ?
+                        " (< min fvblk, guaranteed ECRE-only)" : "");
+            }
+
+            is_read = state->ynqs_is_read;
         }
 
         yapio_niova_slot_t *slot = CIRCLEQ_FIRST(&state->ynqs_idle);
         CIRCLEQ_REMOVE(&state->ynqs_idle, slot, yns_lentry);
 
         slot->yns_md           = md;
+        slot->yns_mixed_op     = mixed_op;
         slot->yns_iov.iov_base = slot->yns_buf;
         slot->yns_iov.iov_len  = io_len;
         slot->yns_running      = true;
 
         vdev_vblk_t vblk = (vdev_vblk_t)(off / YAPIO_NIOVA_BLOCK_SIZE);
 
-        if (!state->ynqs_is_read)
-            yapio_apply_contents_to_io_buffer(slot->yns_buf, io_len, md);
+        if (!is_read)
+        {
+            if (mixed_op)
+                yapio_mixed_fill_slot_if_write(slot->yns_buf, mixed_op,
+                                               is_read);
+            else
+                yapio_apply_contents_to_io_buffer(slot->yns_buf, io_len, md);
+        }
 
         CIRCLEQ_INSERT_TAIL(&state->ynqs_running, slot, yns_lentry);
         state->ynqs_ioh_in_progress++;
 
         log_msg(YAPIO_LL_DEBUG, "niova %s submit j=%d vblk=%lu bytes=%zu",
-                state->ynqs_is_read ? "READ" : "WRITE",
+                is_read ? "READ" : "WRITE",
                 state->ynqs_next_j - 1,
                 (uint64_t)vblk, io_len);
 
-        int rc = state->ynqs_is_read
+        int rc = is_read
             ? NiovaBlockClientReadv(yapioNiovaClient, vblk,
                                     &slot->yns_iov, 1,
                                     yapio_niova_completion_cb, slot)
@@ -852,7 +1291,7 @@ yapio_niova_queue_work_cb(void *arg)
         if (rc < 0)
         {
             log_msg(YAPIO_LL_ERROR, "niova %s submit failed rc=%d j=%d",
-                    state->ynqs_is_read ? "READ" : "WRITE",
+                    is_read ? "READ" : "WRITE",
                     rc, state->ynqs_next_j - 1);
             /* Drive through completion path to keep accounting correct */
             yapio_niova_completion_cb(slot, (ssize_t)rc);
@@ -1091,6 +1530,89 @@ yapio_niova_setup_clients(void)
                     "  io-size      : random per-block [%zu, %zu] bytes "
                     "(-x, pinned by -r seed=%u)\n",
                     yapioIoSizeMin, yapioIoSizeMax, yapioEffectiveBaseSeed);
+
+        if (yapioMixedModeEnabled)
+        {
+            if (yapioNiovaVdevSizeBytes == 0)
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "-p requires a working-set bound: pass -z <bytes>, "
+                        "or connect via -C cp so it can be adopted from "
+                        "the control plane");
+                yapio_exit(YAPIO_EXIT_ERR);
+            }
+
+            yapioMixedTrackedVblks =
+                yapioNiovaVdevSizeBytes / YAPIO_NIOVA_BLOCK_SIZE;
+            if (yapioMixedTrackedVblks < 1)
+                yapioMixedTrackedVblks = 1;
+
+            /* yapio_mixed_ops_setup() clamps any draw wider than the
+             * working set down to the whole working set (vblk_start then
+             * forced to 0, since max_start becomes 0) -- safe, but if even
+             * -x's *minimum* doesn't fit, every single op degenerates to
+             * "the whole working set at offset 0", which defeats the
+             * random-offset/overlap point of this mode entirely. That's a
+             * misconfiguration worth stopping for, not silently living
+             * with -- a max that merely sometimes exceeds the working set
+             * only clamps occasionally, so that's just a warning.
+             */
+            if (yapioIoSizeMin > yapioNiovaVdevSizeBytes)
+            {
+                log_msg(YAPIO_LL_FATAL,
+                        "-p: -x's minimum (%zu bytes) exceeds the working "
+                        "set (%zu bytes) -- every op would degenerate to "
+                        "the whole working set at offset 0. Raise -z or "
+                        "lower -x's minimum.",
+                        yapioIoSizeMin, yapioNiovaVdevSizeBytes);
+                yapio_exit(YAPIO_EXIT_ERR);
+            }
+            if (yapioIoSizeMax > yapioNiovaVdevSizeBytes)
+                log_msg(YAPIO_LL_WARN,
+                        "-p: -x's maximum (%zu bytes) exceeds the working "
+                        "set (%zu bytes) -- draws above the working set "
+                        "size get clamped to the whole working set at "
+                        "offset 0, reducing offset variety for those ops",
+                        yapioIoSizeMax, yapioNiovaVdevSizeBytes);
+
+            if (yapioNiovaQueueDepth != YAPIO_NIOVA_DEF_QUEUE_DEPTH)
+                log_msg(YAPIO_LL_WARN,
+                        "-p forces queue depth to 1 for correctness "
+                        "(a read overlapping an in-flight write has no "
+                        "well-defined result otherwise) -- the -q %zu you "
+                        "passed is ignored",
+                        yapioNiovaQueueDepth);
+
+            size_t tracker_bytes;
+            if (yapioVerifyRead)
+            {
+                yapioMixedGenTrack = YAPIO_CALLOC(yapioMixedTrackedVblks,
+                                                  sizeof(uint16_t));
+                if (!yapioMixedGenTrack)
+                    log_msg(YAPIO_LL_FATAL,
+                            "calloc mixed-mode gen track: %s",
+                            strerror(ENOMEM));
+                tracker_bytes = yapioMixedTrackedVblks * sizeof(uint16_t);
+            }
+            else
+            {
+                tracker_bytes = (yapioMixedTrackedVblks + 7) / 8;
+                yapioMixedHoleBitmap = YAPIO_CALLOC(1, tracker_bytes);
+                if (!yapioMixedHoleBitmap)
+                    log_msg(YAPIO_LL_FATAL,
+                            "calloc mixed-mode hole bitmap: %s",
+                            strerror(ENOMEM));
+            }
+
+            fprintf(stderr,
+                    "  mixed r/w    : write=%d%% read=%d%%, working set "
+                    "%lu vblks (%zu bytes), tracker=%s (%zu bytes/rank)\n",
+                    yapioMixedWritePct, 100 - yapioMixedWritePct,
+                    (unsigned long)yapioMixedTrackedVblks,
+                    yapioNiovaVdevSizeBytes,
+                    yapioVerifyRead ? "generation array" : "bitmap (-V)",
+                    tracker_bytes);
+        }
     }
 
     /* Validate that the user's -b block size (or, in -x mode, the upper
@@ -1295,7 +1817,11 @@ yapio_print_help(int exit_val)
                 "\t    - m (mmap)\n"
                 "\t-n  Network only test\n"
                 "\t-N  Number of blocks per task\n"
-                "\t-V  Disable read verification\n"
+                "\t-V  Disable read verification. In -p mixed mode this also\n"
+                "\t    switches the per-rank tracking structure from a\n"
+                "\t    content-verified generation array to a much cheaper\n"
+                "\t    hole/not-hole bitmap (~32x less memory, no content\n"
+                "\t    check) -- see -p's entry.\n"
                 "\t-W  Enable word-level buffer uniqueness (default: fast seed fill)\n"
                 "\t-q  Niova queue depth (default 12, max 256, niova mode only)\n"
                 "\t-r  Random seed: pins the block-shuffle / sparse-IO PRNG\n"
@@ -1313,13 +1839,26 @@ yapio_print_help(int exit_val)
                 "\t    compact min/max/avg size summary per rank is always\n"
                 "\t    printed at the end of each phase; pass -d 3 for a\n"
                 "\t    per-op trace of every block's offset and size.\n"
+                "\t-p  <write%%>:<read%%>  Mixed interleaved random r/w\n"
+                "\t    (niova mode only; requires -t's 'Z' token instead of\n"
+                "\t    w/r, plus -x for op size and -z for the working-set\n"
+                "\t    bound). Each op independently picks type/offset/size;\n"
+                "\t    offsets can overlap, so later ops can partially\n"
+                "\t    overwrite earlier ones. Queue depth is forced to 1\n"
+                "\t    (correctness over pipelining -- a read overlapping an\n"
+                "\t    in-flight write has no well-defined result otherwise).\n"
+                "\t    Default (no -V): per-vblk generation tracking with\n"
+                "\t    full content verification on every read. With -V: a\n"
+                "\t    1-bit hole/not-hole bitmap instead (~32x less memory,\n"
+                "\t    no content check) -- see -V's entry.\n"
                 "\t-s  Display test duration and barrier wait times\n"
                 "\t-S  Number of seconds before stonewalling\n\n"
                 "\t-t  Test description\n"
                 "\t    - Prefix:     P{prefix}\n"
                 "\t    - Restart:    X{suffix}\n"
                 "\t    - Pattern:    sequential (s), random (R), strided (S)\n"
-                "\t    - I/O Op:     read (r), write (w)\n"
+                "\t    - I/O Op:     read (r), write (w), mixed r/w (Z;\n"
+                "\t                  requires -p, see its entry)\n"
                 "\t    - Locality:   local (L), distributed (D)\n"
                 "\t    - Sparse I/O: missed percentage (M), only do M percent of I/Os\n"
                 "\t    - Options:    backwards (b), holes (h), no-fsync (f)\n"
@@ -1537,6 +2076,12 @@ yapio_parse_test_recipe(const char *recipe_str)
                 ytc->ytc_read = 1;
             break;
 
+        case 'Z': //mixed read/write mode -- mutually exclusive with w/r too;
+                  //requires -p <write%>:<read%> (validated post-getopts)
+            if (!++rw)
+                ytc->ytc_mixed_rw = 1;
+            break;
+
         case 's': //'s', 'S', and 'r' are mutually exclusive:
             if (!++io_pattern)
                 ytc->ytc_io_pattern = YAPIO_IOP_SEQUENTIAL;
@@ -1599,8 +2144,13 @@ yapio_parse_test_recipe(const char *recipe_str)
 
         rc = -EINVAL;
     }
-    else if (io_pattern)
+    else if (io_pattern && !ytg->ytg_contexts[test_ctx_idx].ytc_mixed_rw)
     {
+        /* Mixed r/w mode ('Z') decides each op's type/offset/size
+         * internally (see yapio_mixed_ops_setup()) -- it has no single
+         * io_pattern for the whole context, so s/S/R is neither required
+         * nor meaningful here.
+         */
         if (io_pattern > 0)
         {
             log_msg_r0(YAPIO_LL_ERROR,
@@ -1902,6 +2452,31 @@ yapio_getopts(int argc, char **argv)
             yapioIoSizeRandomEnabled = true;
             break;
         }
+        case 'p':
+        {
+            char *sep = strchr(optarg, ':');
+            if (!sep)
+            {
+                fprintf(stderr,
+                        "-p requires <write%%>:<read%%>, e.g. -p 20%%:80%%\n");
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            long write_pct = strtol(optarg, NULL, 10);
+            long read_pct  = strtol(sep + 1, NULL, 10);
+
+            if (write_pct < 0 || read_pct < 0 || write_pct + read_pct != 100)
+            {
+                fprintf(stderr,
+                        "-p <write%%>:<read%%> must be non-negative and sum "
+                        "to 100 (got %ld + %ld).\n", write_pct, read_pct);
+                yapio_print_help(YAPIO_EXIT_ERR);
+            }
+
+            yapioMixedWritePct = (int)write_pct;
+            yapioMixedModeEnabled = true;
+            break;
+        }
 #endif
         default:
             yapio_print_help(YAPIO_EXIT_ERR);
@@ -1970,6 +2545,64 @@ yapio_getopts(int argc, char **argv)
             yapioTestGroups[i].ytg_io_size_min = yapioIoSizeMin;
             yapioTestGroups[i].ytg_io_size_random = true;
         }
+    }
+
+    if (yapioMixedModeEnabled)
+    {
+        if (yapioModeCurrent != YAPIO_IO_MODE_NIOVA)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "-p <write%%>:<read%%> requires niova mode (-m N)");
+            yapio_print_help(YAPIO_EXIT_ERR);
+        }
+        if (!yapioIoSizeRandomEnabled)
+        {
+            log_msg(YAPIO_LL_FATAL,
+                    "-p requires -x <min>:<max> (op size range)");
+            yapio_print_help(YAPIO_EXIT_ERR);
+        }
+
+        bool any_mixed_ctx = false;
+        for (int i = 0; i < yapioNumTestGroups; i++)
+        {
+            yapio_test_group_t *ytg = &yapioTestGroups[i];
+            for (int j = 0; j < ytg->ytg_num_contexts; j++)
+            {
+                if (!ytg->ytg_contexts[j].ytc_mixed_rw)
+                    continue;
+
+                any_mixed_ctx = true;
+                if (ytg->ytg_contexts[j].ytc_remote_locality)
+                {
+                    log_msg(YAPIO_LL_FATAL,
+                            "-t Z (mixed r/w) does not support distributed "
+                            "(D) locality -- each rank's mixed op stream is "
+                            "self-contained");
+                    yapio_print_help(YAPIO_EXIT_ERR);
+                }
+            }
+        }
+        if (!any_mixed_ctx)
+        {
+            log_msg(YAPIO_LL_FATAL, "-p requires -t with the 'Z' token");
+            yapio_print_help(YAPIO_EXIT_ERR);
+        }
+        /* yapioNiovaVdevSizeBytes (the working-set bound -- -z, or CP-mode
+         * auto-adopt) isn't necessarily known yet here; validated once it
+         * is final, in yapio_niova_setup_clients().
+         */
+    }
+    else
+    {
+        for (int i = 0; i < yapioNumTestGroups; i++)
+            for (int j = 0; j < yapioTestGroups[i].ytg_num_contexts; j++)
+                if (yapioTestGroups[i].ytg_contexts[j].ytc_mixed_rw)
+                {
+                    log_msg(YAPIO_LL_FATAL,
+                            "-t 'Z' (mixed r/w) requires "
+                            "-p <write%%>:<read%%>");
+                    yapio_print_help(YAPIO_EXIT_ERR);
+                }
     }
 #endif
 
@@ -2263,6 +2896,24 @@ yapio_destroy_buffers(void)
     {
         YAPIO_FREE(yapioNiovaSlotBufs);
         yapioNiovaSlotBufs = NULL;
+    }
+
+    if (yapioMixedOps)
+    {
+        YAPIO_FREE(yapioMixedOps);
+        yapioMixedOps = NULL;
+    }
+
+    if (yapioMixedGenTrack)
+    {
+        YAPIO_FREE(yapioMixedGenTrack);
+        yapioMixedGenTrack = NULL;
+    }
+
+    if (yapioMixedHoleBitmap)
+    {
+        YAPIO_FREE(yapioMixedHoleBitmap);
+        yapioMixedHoleBitmap = NULL;
     }
 #endif
 }
@@ -2787,9 +3438,17 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
     yapio_test_group_t *ytg = ytc->ytc_group;
     int rc = 0;
 
-    const yapio_blk_md_t *md_array =
-        yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
-                                   &ytc->ytc_num_ops_expected);
+    /* Mixed r/w mode (-p): ytc_num_ops_expected and the per-op array
+     * (yapioMixedOps, not ytc_in_out_md_ops) are already set by
+     * yapio_mixed_ops_setup() (called from yapio_test_context_setup()) --
+     * skip the normal md-array lookup entirely.
+     */
+    const yapio_blk_md_t *md_array = NULL;
+#ifdef YAPIO_NIOVA
+    if (!ytc->ytc_mixed_rw)
+#endif
+        md_array = yapio_test_ctx_to_md_array(ytc, YAPIO_TEST_CTX_MDH_IN,
+                                              &ytc->ytc_num_ops_expected);
 
     log_msg(YAPIO_LL_DEBUG, "rank=%d op=%s blk_sz=%zu nops=%d",
             yapioMyRank, ytc->ytc_read ? "read" : "write",
@@ -2818,8 +3477,22 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
         CIRCLEQ_INIT(&qs->ynqs_idle);
         CIRCLEQ_INIT(&qs->ynqs_running);
 
-        qs->ynqs_num_ioh      = MIN(ytc->ytc_num_ops_expected,
+        qs->ynqs_mixed_mode   = ytc->ytc_mixed_rw;
+        if (ytc->ytc_mixed_rw)
+        {
+            /* Forced to 1 in-flight op: a read overlapping an in-flight
+             * write has no well-defined expected content otherwise (see
+             * yapio_mixed_ops_setup()'s header comment) -- correctness
+             * over pipelining for this mode.
+             */
+            qs->ynqs_num_ioh  = 1;
+            qs->ynqs_mixed_ops = yapioMixedOps;
+        }
+        else
+        {
+            qs->ynqs_num_ioh  = MIN(ytc->ytc_num_ops_expected,
                                     (int)yapioNiovaQueueDepth);
+        }
         qs->ynqs_md_array     = md_array;
         qs->ynqs_total_blocks = ytc->ytc_num_ops_expected;
         qs->ynqs_target       = ytc->ytc_num_ops_expected;
@@ -2867,6 +3540,17 @@ yapio_perform_io(yapio_test_ctx_t *ytc)
                     qs->ynqs_io_size_sum / (size_t)qs->ynqs_io_size_cnt,
                     qs->ynqs_io_size_below_min_fvblk_cnt, qs->ynqs_io_size_cnt,
                     YAPIO_MIN_ECHUNK_FVBLK_BYTES);
+
+        if (qs->ynqs_mixed_mode)
+            fprintf(stderr,
+                    "[rank %d] -p mixed r/w summary: writes=%d reads=%d "
+                    "holes=%d mismatches=%d (%s)\n",
+                    yapioMyRank, qs->ynqs_mixed_write_cnt,
+                    qs->ynqs_mixed_read_cnt, qs->ynqs_mixed_hole_cnt,
+                    qs->ynqs_mixed_mismatch_cnt,
+                    yapioMixedHoleBitmap ?
+                    "bitmap mode, -V: hole-detection only, no content check" :
+                    "generation mode: content-verified");
 
         pthread_mutex_destroy(&qs->ynqs_done_mutex);
         pthread_cond_destroy(&qs->ynqs_done_cond);
@@ -3484,6 +4168,11 @@ yapio_test_context_setup(yapio_test_ctx_t *ytc, const int test_num)
     ytc->ytc_run_status = YAPIO_TEST_CTX_RUN_NOT_STARTED;
 
     yapio_reseed_for_phase();
+
+#ifdef YAPIO_NIOVA
+    if (ytc->ytc_mixed_rw)
+        return yapio_mixed_ops_setup(ytc);
+#endif
 
     int rc = ytc->ytc_remote_locality ?
         yapio_test_context_setup_distributed(ytc) :
